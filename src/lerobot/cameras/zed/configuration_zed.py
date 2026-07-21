@@ -34,16 +34,19 @@ FPS_CHOICES = (15, 30, 60, 100)
 @CameraConfig.register_subclass("zed")
 @dataclass
 class ZedCameraConfig(CameraConfig):
-    """Configuration for one eye of a ZED / ZED-Mini / ZED-2 / ZED-2i camera.
+    """Configuration for one eye (or the raw stereo pair) of a ZED / ZED-Mini /
+    ZED-2 / ZED-2i camera.
 
-    The camera delivers a single side-by-side stereo frame per capture, so it's
-    exposed as two dataset camera keys backed by two `ZedCameraConfig`/`ZedCamera`
-    instances (`side="left"` and `side="right"`) rather than one camera returning a
-    double-wide image. Both instances must share the same `serial_number` (or both
-    leave it as the default `None`, for auto-detecting the sole/first connected ZED)
-    -- the underlying capture device is then opened exactly once and shared between
-    them (see `ZedCamera`/`_ZedDevice` in `camera_zed.py`), since the physical
-    /dev/video node can't be opened twice.
+    The camera delivers a single side-by-side stereo frame per capture. Requesting
+    `side="left"` or `side="right"` exposes just that eye, cropped from the raw
+    frame -- useful for treating each eye as its own dataset camera key via two
+    `ZedCameraConfig`/`ZedCamera` instances. `side="stereo"` instead returns the
+    full, uncropped side-by-side frame (both eyes, at `2 * width` pixels wide) from
+    a single instance. All instances of the same physical camera must share the
+    same `serial_number` (or all leave it as the default `None`, for auto-detecting
+    the sole/first connected ZED) -- the underlying capture device is then opened
+    exactly once and shared between them (see `ZedCamera`/`_ZedDevice` in
+    `camera_zed.py`), since the physical /dev/video node can't be opened twice.
 
     Example:
         ```python
@@ -51,19 +54,23 @@ class ZedCameraConfig(CameraConfig):
             "zed_left": ZedCameraConfig(side="left", serial_number="13925480"),
             "zed_right": ZedCameraConfig(side="right", serial_number="13925480"),
         }
+        # or, for the raw undivided stereo frame:
+        cameras = {"zed_stereo": ZedCameraConfig(side="stereo", serial_number="13925480")}
         ```
 
     Attributes:
-        side: Which eye this camera instance reads ("left" or "right").
+        side: Which eye this camera instance reads ("left" or "right"), or "stereo"
+            for the full undivided side-by-side frame.
         serial_number: ZED serial number to open a specific camera. `None` (default)
             auto-detects the first ZED found -- fine for a single-camera setup.
         fps: One of (15, 30, 60, 100), subject to the resolution's own fps ceiling
             (see zed-open-capture's RESOLUTION/FPS docs). Defaults to 30.
         width, height: Per-eye pixel size; must be one of the pairs in `RESOLUTIONS`
             (2208x1242, 1920x1080, 1280x720, 672x376). Defaults to 1280x720 (HD720).
+            In "stereo" mode the returned frame is `2 * width` pixels wide.
     """
 
-    side: Literal["left", "right"]
+    side: Literal["left", "right", "stereo"]
     serial_number: str | None = None
 
     def __post_init__(self) -> None:

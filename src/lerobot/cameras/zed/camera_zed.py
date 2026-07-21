@@ -184,11 +184,14 @@ def find_zed_cameras() -> list[dict[str, Any]]:
 
 
 class ZedCamera(Camera):
-    """One eye (left or right) of a ZED/ZED-Mini/ZED-2/ZED-2i stereo camera.
+    """One eye (left or right), or the raw stereo pair, of a ZED/ZED-Mini/ZED-2/
+    ZED-2i stereo camera.
 
-    See `ZedCameraConfig` for why this is split into two per-camera objects instead of
-    one camera returning a double-wide image, and `_ZedDevice` for how the two share
-    one underlying capture device.
+    See `ZedCameraConfig` for why a single eye is split into its own per-camera
+    object instead of one camera returning a double-wide image (and for the
+    `side="stereo"` alternative that does return the double-wide image), and
+    `_ZedDevice` for how multiple `ZedCamera` instances of the same physical
+    camera share one underlying capture device.
 
     Example:
         ```python
@@ -202,6 +205,12 @@ class ZedCamera(Camera):
         right_image = right.read()
         left.disconnect()
         right.disconnect()  # device only actually closes here
+
+        # or, for the raw undivided stereo frame:
+        stereo = ZedCamera(ZedCameraConfig(side="stereo", serial_number="13925480"))
+        stereo.connect()
+        stereo_image = stereo.read()
+        stereo.disconnect()
         ```
     """
 
@@ -250,6 +259,8 @@ class ZedCamera(Camera):
         logger.info(f"{self} connected.")
 
     def _crop(self, bgr: NDArray[Any]) -> NDArray[Any]:
+        if self.side == "stereo":
+            return bgr
         half = bgr.shape[1] // 2
         return bgr[:, :half] if self.side == "left" else bgr[:, half:]
 
