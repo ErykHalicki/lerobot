@@ -139,15 +139,27 @@ class RebotArm102Leader(Teleoperator):
         for motor_id in self.config.joint_ids.values():
             self.bus.reset_multi_turn(motor_id)
 
+    # sync_monitor() is fast (~3-5ms) for up to 4 servo ids in one call, but past
+    # that it starts intermittently stalling for ~100ms regardless of which ids
+    # are included -- not a bad servo, a batch-size limit in the sync command
+    # itself (see docs/b601_teleop_jitter_debug.md). Splitting into <=4-id
+    # chunks keeps every call in the fast regime, so all 7 servos still get
+    # read every tick at full rate instead of falling back to a lower refresh
+    # rate for some of them.
+    _MAX_SYNC_MONITOR_IDS = 4
+
     def _read_raw_positions(self) -> dict[str, float]:
-        result: dict[int, ServoMonitor | None] = self.bus.sync_monitor(list(self.config.joint_ids.values()))
+        all_ids = list(self.config.joint_ids.values())
         id_to_name = {v: k for k, v in self.config.joint_ids.items()}
         raw_positions: dict[str, float] = {}
-        for motor_id, monitor in result.items():
-            motor_name = id_to_name[motor_id]
-            if monitor is None:
-                raise RuntimeError(f"Servo {motor_name} (id={motor_id}) has never responded.")
-            raw_positions[motor_name] = monitor.angle_deg
+        for i in range(0, len(all_ids), self._MAX_SYNC_MONITOR_IDS):
+            chunk = all_ids[i : i + self._MAX_SYNC_MONITOR_IDS]
+            result: dict[int, ServoMonitor | None] = self.bus.sync_monitor(chunk)
+            for motor_id, monitor in result.items():
+                motor_name = id_to_name[motor_id]
+                if monitor is None:
+                    raise RuntimeError(f"Servo {motor_name} (id={motor_id}) has never responded.")
+                raw_positions[motor_name] = monitor.angle_deg
         return raw_positions
 
     @staticmethod
