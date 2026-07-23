@@ -99,6 +99,8 @@ def _follower_process_main(
     goal_pos_shared,
     goal_ready,
     present_pos_shared,
+    present_torq_shared,
+    present_vel_shared,
     present_pos_ts,
     last_sent_shared,
     has_sent_ever,
@@ -112,8 +114,9 @@ def _follower_process_main(
     process can delay it by holding the GIL.
 
     Communicates via shared memory only: `goal_pos_shared` (target),
-    `present_pos_shared`/`present_pos_ts` (latest reading), `last_sent_shared`
-    (what was actually sent). `command_queue` carries disable/enable/clear_error.
+    `present_pos_shared`/`present_torq_shared`/`present_vel_shared`/
+    `present_pos_ts` (latest reading), `last_sent_shared` (what was actually
+    sent). `command_queue` carries disable/enable/clear_error.
     """
     # Ignore SIGINT: a raw Ctrl-C could interrupt a send_mit() call
     # mid-transaction and leave a motor comm-faulted. Shutdown goes through
@@ -205,6 +208,8 @@ def _follower_process_main(
             for i, name in enumerate(motor_names):
                 state = motors[name].get_state()
                 present_pos_shared[i] = math.degrees(state.pos) if state is not None else 0.0
+                present_torq_shared[i] = state.torq if state is not None else 0.0
+                present_vel_shared[i] = math.degrees(state.vel) if state is not None else 0.0
             present_pos_ts.value = time.perf_counter()
 
             if goal_ready.value:
@@ -323,6 +328,10 @@ class RebotB601Follower(Robot):
         self._goal_ready = self._mp_ctx.Value("b", 0, lock=False)
         # Written every tick by the follower process, read by _present_pos().
         self._present_pos_shared = self._mp_ctx.Array("d", n, lock=False)
+        # Written every tick alongside present_pos_shared, read by _present_torq().
+        self._present_torq_shared = self._mp_ctx.Array("d", n, lock=False)
+        # Written every tick alongside present_pos_shared, read by _present_vel().
+        self._present_vel_shared = self._mp_ctx.Array("d", n, lock=False)
         self._present_pos_ts = self._mp_ctx.Value("d", 0.0, lock=False)
         # Smoothed position actually sent, read by send_action()'s return value.
         self._last_sent_shared = self._mp_ctx.Array("d", n, lock=False)
@@ -339,6 +348,14 @@ class RebotB601Follower(Robot):
         return {f"{motor}.pos": float for motor in self.motor_names}
 
     @property
+    def _motors_torq_ft(self) -> dict[str, type]:
+        return {f"{motor}.torq": float for motor in self.motor_names}
+
+    @property
+    def _motors_vel_ft(self) -> dict[str, type]:
+        return {f"{motor}.vel": float for motor in self.motor_names}
+
+    @property
     def _cameras_ft(self) -> dict[str, tuple]:
         features: dict[str, tuple] = {}
         for cam in self.cameras:
@@ -351,7 +368,7 @@ class RebotB601Follower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft, **self._motors_torq_ft, **self._motors_vel_ft, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -530,6 +547,25 @@ class RebotB601Follower(Robot):
             return dict.fromkeys(self.motor_names, 0.0)
         return {name: self._present_pos_shared[i] for i, name in enumerate(self.motor_names)}
 
+    def _present_torq(self) -> dict[str, float]:
+        """Read present joint torque (Nm) from the follower process's latest
+        reading. Same source tick as _present_pos(): the CAN feedback frame
+        motorbridge's get_state() already polls every tick reports pos, vel,
+        and torq together. Falls back to 0.0 per joint before the follower
+        process's first tick."""
+        if self._present_pos_ts.value == 0.0:
+            return dict.fromkeys(self.motor_names, 0.0)
+        return {name: self._present_torq_shared[i] for i, name in enumerate(self.motor_names)}
+
+    def _present_vel(self) -> dict[str, float]:
+        """Read present joint velocity (deg/s) from the follower process's
+        latest reading. Same source tick as _present_pos()/_present_torq().
+        Falls back to 0.0 per joint before the follower process's first
+        tick."""
+        if self._present_pos_ts.value == 0.0:
+            return dict.fromkeys(self.motor_names, 0.0)
+        return {name: self._present_vel_shared[i] for i, name in enumerate(self.motor_names)}
+
     def _read_camera_or_last(self, cache_key: str, read_fn) -> Any:
         """Call `read_fn()`, falling back to the last successfully-read frame
         for `cache_key` on failure instead of crashing. Logs on the 1st
@@ -562,6 +598,8 @@ class RebotB601Follower(Robot):
     def get_observation(self) -> RobotObservation:
         start = time.perf_counter()
         obs_dict = {f"{motor}.pos": pos for motor, pos in self._present_pos().items()}
+        obs_dict.update({f"{motor}.torq": torq for motor, torq in self._present_torq().items()})
+        obs_dict.update({f"{motor}.vel": vel for motor, vel in self._present_vel().items()})
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
@@ -638,6 +676,8 @@ class RebotB601Follower(Robot):
                 self._goal_pos_shared,
                 self._goal_ready,
                 self._present_pos_shared,
+                self._present_torq_shared,
+                self._present_vel_shared,
                 self._present_pos_ts,
                 self._last_sent_shared,
                 self._has_sent_ever,

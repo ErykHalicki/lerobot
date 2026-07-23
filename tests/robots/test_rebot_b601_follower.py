@@ -70,10 +70,14 @@ def follower():
 def test_features_match_joints():
     with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
         robot = RebotB601Follower(RebotB601FollowerRobotConfig(port="/dev/null"))
-    expected = {f"{m}.pos" for m in robot.motor_names}
-    assert set(robot.action_features) == expected
-    assert set(robot.observation_features) == expected
-    assert "gripper.pos" in expected
+    expected_pos = {f"{m}.pos" for m in robot.motor_names}
+    expected_torq = {f"{m}.torq" for m in robot.motor_names}
+    expected_vel = {f"{m}.vel" for m in robot.motor_names}
+    assert set(robot.action_features) == expected_pos
+    assert set(robot.observation_features) == expected_pos | expected_torq | expected_vel
+    assert "gripper.pos" in expected_pos
+    assert "gripper.torq" in expected_torq
+    assert "gripper.vel" in expected_vel
 
 
 def test_connect_disconnect(follower):
