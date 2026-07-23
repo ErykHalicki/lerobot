@@ -49,8 +49,14 @@ class RebotB601FollowerConfig:
     return_home_on_disconnect: bool = True
 
     # Time to spend ramping to the home position in disconnect(), regardless
-    # of starting distance.
+    # of starting distance. The gripper opens fully during this ramp instead
+    # of moving to 0° with the other joints, so it can't be gripping anything
+    # while the arm moves.
     home_duration_s: float = 5.0
+
+    # Time to spend closing the gripper to 0° after home_duration_s, once
+    # every other joint (and the gripper itself, fully open) has arrived.
+    gripper_close_duration_s: float = 2.0
 
     # `max_relative_target` limits the magnitude of the relative positional target
     # vector for safety purposes (in degrees). Set to a positive scalar to apply the

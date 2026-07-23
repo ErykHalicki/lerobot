@@ -202,10 +202,10 @@ intelrealsense = [
     "pyrealsense2-macosx>=2.54,<2.57.0 ; sys_platform == 'darwin'",
 ]
 # ZED/ZED-Mini/ZED-2/ZED-2i via py-zed-open-capture (no CUDA/ZED SDK needed).
-# linux_aarch64 only for now; not on PyPI, installed straight from the GitHub
-# release wheel -- see https://github.com/ErykHalicki/py-zed-open-capture
+# On PyPI with prebuilt linux x86_64/aarch64 wheels -- see
+# https://github.com/ErykHalicki/py-zed-open-capture
 zed = [
-    "py-zed-open-capture @ https://github.com/ErykHalicki/py-zed-open-capture/releases/download/v0.1.0/py_zed_open_capture-0.1.0-cp312-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "py-zed-open-capture>=0.1.2 ; sys_platform == 'linux'",
 ]
 phone = ["hebi-py>=2.8.0,<2.12.0", "teleop>=0.1.0,<0.2.0", "fastapi<1.0", "lerobot[scipy-dep]"]
 

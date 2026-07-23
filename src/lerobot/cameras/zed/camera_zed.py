@@ -76,7 +76,7 @@ class _ZedDevice:
         self._refcount = 0
         self._cap: Any = None
         self._cached_frame_id: int | None = None
-        self._cached_bgr: NDArray[Any] | None = None
+        self._cached_rgb: NDArray[Any] | None = None
         self._latest_timestamp: float | None = None
         self._new_frame_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -127,7 +127,7 @@ class _ZedDevice:
                 )
             self._cap = cap
             self._cached_frame_id = None
-            self._cached_bgr = None
+            self._cached_rgb = None
             self._latest_timestamp = None
         self._start_read_thread()
 
@@ -148,7 +148,7 @@ class _ZedDevice:
             self._cap = None  # no explicit close in the native API; dropping the last
             # reference stops its capture thread and releases the device fd
             self._cached_frame_id = None
-            self._cached_bgr = None
+            self._cached_rgb = None
             self._latest_timestamp = None
 
     @property
@@ -176,9 +176,9 @@ class _ZedDevice:
                 frame = cap.get_last_frame(1000)
                 if frame is None:
                     continue  # no new frame within the timeout; keep polling
-                bgr = zoc.to_bgr(frame)
+                rgb = zoc.to_rgb(frame)
                 with self._lock:
-                    self._cached_bgr = bgr
+                    self._cached_rgb = rgb
                     self._cached_frame_id = frame.frame_id
                     self._latest_timestamp = time.perf_counter()
                 self._new_frame_event.set()
@@ -224,16 +224,16 @@ class _ZedDevice:
             raise TimeoutError(f"Timed out waiting for a ZED frame after {timeout_ms} ms.")
 
         with self._lock:
-            if self._cached_bgr is None:
+            if self._cached_rgb is None:
                 raise RuntimeError(f"Internal error: {self} event set but no frame available.")
-            return self._cached_bgr
+            return self._cached_rgb
 
     def get_latest_frame(self, max_age_ms: int) -> NDArray[Any]:
         """Non-blocking: returns whatever the background thread most recently
         buffered, regardless of whether it's new since the last call. Used by
         `read_latest()`."""
         with self._lock:
-            frame = self._cached_bgr
+            frame = self._cached_rgb
             timestamp = self._latest_timestamp
         if frame is None or timestamp is None:
             raise RuntimeError(f"{self} has not captured any frames yet.")
@@ -353,11 +353,11 @@ class ZedCamera(Camera):
 
         logger.info(f"{self} connected.")
 
-    def _crop(self, bgr: NDArray[Any]) -> NDArray[Any]:
+    def _crop(self, rgb: NDArray[Any]) -> NDArray[Any]:
         if self.side == "stereo":
-            return bgr
-        half = bgr.shape[1] // 2
-        return bgr[:, :half] if self.side == "left" else bgr[:, half:]
+            return rgb
+        half = rgb.shape[1] // 2
+        return rgb[:, :half] if self.side == "left" else rgb[:, half:]
 
     @check_if_not_connected
     def read(self, timeout_ms: int = 1000) -> NDArray[Any]:

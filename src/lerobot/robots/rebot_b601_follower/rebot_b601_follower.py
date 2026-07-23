@@ -682,23 +682,34 @@ class RebotB601Follower(Robot):
         except (AttributeError, OSError) as e:
             logger.warning(f"{self}: could not set follower process CPU affinity to {cores}: {e}")
 
-    def _go_home(self) -> None:
-        """Ramp every joint to 0° (the calibration zero pose) over
-        `home_duration_s`, independent of starting distance: each tick's
-        target is an eased interpolation between the starting position and
-        0°, not 0° itself, so a joint that starts far from home doesn't move
-        any faster than one that starts close."""
-        start = self._present_pos()
-        duration = self.config.home_duration_s
+    def _ramp(self, targets: dict[str, tuple[float, float]], duration: float) -> None:
+        """Ramp each motor in `targets` (name -> (start, end)) from start to end
+        over `duration` seconds, independent of distance: each tick's target is
+        an eased interpolation, not the endpoint itself, so a motor that starts
+        far from its target doesn't move any faster than one that starts close."""
         tick = 1.0 / self.config.send_rate_hz
         t0 = time.monotonic()
         while True:
             frac = min(1.0, (time.monotonic() - t0) / duration)
             eased = frac * frac * (3.0 - 2.0 * frac)  # smoothstep: zero velocity at both ends
-            self.send_action({f"{name}.pos": start[name] * (1.0 - eased) for name in self.motor_names})
+            self.send_action({f"{name}.pos": start + eased * (end - start) for name, (start, end) in targets.items()})
             if frac >= 1.0:
                 return
             time.sleep(tick)
+
+    def _go_home(self) -> None:
+        """Ramp every joint to 0° (the calibration zero pose) over
+        `home_duration_s`, except the gripper: it opens all the way during
+        that same ramp (so it can't be gripping anything while the arm
+        moves), then closes to 0° afterward over `gripper_close_duration_s`."""
+        start = self._present_pos()
+        gripper_open = self.config.joint_limits[GRIPPER_MOTOR][0]
+
+        targets = {name: (start[name], 0.0) for name in self.motor_names if name != GRIPPER_MOTOR}
+        targets[GRIPPER_MOTOR] = (start[GRIPPER_MOTOR], gripper_open)
+        self._ramp(targets, self.config.home_duration_s)
+
+        self._ramp({GRIPPER_MOTOR: (gripper_open, 0.0)}, self.config.gripper_close_duration_s)
 
     @check_if_not_connected
     def disconnect(self) -> None:
