@@ -224,6 +224,12 @@ class RecordConfig:
 """
 
 
+# Per-step timing breakdown for diagnosing "Record loop is running slower..." warnings.
+# Silent by default (standard logger level gating, no per-iteration overhead beyond the
+# isEnabledFor() check below); enable by attaching a DEBUG-level handler to this logger.
+_PROFILE_LOGGER = logging.getLogger("lerobot.record_loop_profile")
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -245,9 +251,23 @@ def record_loop(
     display_data: bool = False,
     display_mode: str = "rerun",
     display_compressed_images: bool = False,
+    control_fps: int | None = None,
 ):
+    """
+    control_fps: if set, the get_observation/get_action/send_action cycle (arm
+    control) runs at this rate instead of `fps`, while dataset frames are still
+    only added at `fps` (e.g. control at 60Hz, record at 30Hz to match camera
+    fps). Must be a whole multiple of `fps`. `None` (default) keeps control and
+    recording at the same rate, i.e. the original behavior.
+    """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+
+    if control_fps is None:
+        control_fps = fps
+    if control_fps < fps or control_fps % fps != 0:
+        raise ValueError(f"control_fps ({control_fps}) must be a whole multiple of fps ({fps}).")
+    record_every_n_ticks = control_fps // fps
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
@@ -274,37 +294,59 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    control_interval = 1 / fps
+    control_interval = 1 / control_fps
 
     no_action_count = 0
     timestamp = 0
+    tick = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+        profiling = _PROFILE_LOGGER.isEnabledFor(logging.DEBUG)
+        step_times: dict[str, float] = {}
+        should_record = dataset is not None and tick % record_every_n_ticks == 0
 
         if events["exit_early"]:
             events["exit_early"] = False
             break
 
         # Get robot observation
+        t0 = time.perf_counter()
         obs = robot.get_observation()
+        if profiling:
+            step_times["get_observation"] = time.perf_counter() - t0
 
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+        t0 = time.perf_counter()
         obs_processed = robot_observation_processor(obs)
+        if profiling:
+            step_times["robot_observation_processor"] = time.perf_counter() - t0
 
-        if dataset is not None:
+        if should_record:
+            t0 = time.perf_counter()
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            if profiling:
+                step_times["build_observation_frame"] = time.perf_counter() - t0
 
         # Get action from teleop
         if isinstance(teleop, Teleoperator):
+            t0 = time.perf_counter()
             act = teleop.get_action()
+            if profiling:
+                step_times["teleop.get_action"] = time.perf_counter() - t0
             if robot.name == "unitree_g1":
                 teleop.send_feedback(obs)
 
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
+            t0 = time.perf_counter()
             act_processed_teleop = teleop_action_processor((act, obs))
+            if profiling:
+                step_times["teleop_action_processor"] = time.perf_counter() - t0
             action_values = act_processed_teleop
+            t0 = time.perf_counter()
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            if profiling:
+                step_times["robot_action_processor"] = time.perf_counter() - t0
 
         elif isinstance(teleop, list):
             arm_action = teleop_arm.get_action()
@@ -329,13 +371,19 @@ def record_loop(
         # Action can eventually be clipped using `max_relative_target`,
         # so action actually sent is saved in the dataset. action = postprocessor.process(action)
         # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+        t0 = time.perf_counter()
         _sent_action = robot.send_action(robot_action_to_send)
+        if profiling:
+            step_times["robot.send_action"] = time.perf_counter() - t0
 
-        # Write to dataset
-        if dataset is not None:
+        # Write to dataset (only on recording ticks; see control_fps)
+        if should_record:
+            t0 = time.perf_counter()
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
+            if profiling:
+                step_times["build_action_frame_and_add_frame"] = time.perf_counter() - t0
 
         if display_data:
             log_visualization_data(
@@ -347,14 +395,19 @@ def record_loop(
 
         dt_s = time.perf_counter() - start_loop_t
 
+        if profiling:
+            step_times["total_loop"] = dt_s
+            _PROFILE_LOGGER.debug(" ".join(f"{name}={dur * 1000:.1f}ms" for name, dur in step_times.items()))
+
         sleep_time_s: float = control_interval - dt_s
         if sleep_time_s < 0:
             logging.warning(
-                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target FPS ({fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                f"Record loop is running slower ({1 / dt_s:.1f} Hz) than the target control rate ({control_fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
             )
 
         precise_sleep(max(sleep_time_s, 0.0))
 
+        tick += 1
         timestamp = time.perf_counter() - start_episode_t
 
 

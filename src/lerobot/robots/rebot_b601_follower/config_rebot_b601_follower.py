@@ -44,6 +44,14 @@ class RebotB601FollowerConfig:
 
     disable_torque_on_disconnect: bool = True
 
+    # On disconnect(), ramp every joint back to 0° (the calibration zero
+    # pose) before stopping the follower process.
+    return_home_on_disconnect: bool = True
+
+    # Time to spend ramping to the home position in disconnect(), regardless
+    # of starting distance.
+    home_duration_s: float = 5.0
+
     # `max_relative_target` limits the magnitude of the relative positional target
     # vector for safety purposes (in degrees). Set to a positive scalar to apply the
     # same value to all motors, or to a dict mapping motor names to per-motor values.
@@ -86,6 +94,28 @@ class RebotB601FollowerConfig:
     # MIT only.
     gripper_mit_kp: float = 8.0
     gripper_mit_kd: float = 0.3
+
+    # send_action() only updates the target; a separate follower process
+    # commands the motors at this fixed rate, independent of how often or
+    # irregularly the caller calls send_action().
+    send_rate_hz: float = 100.0
+
+    # If set, the follower process attaches its own FileHandler to this path
+    # and enables DEBUG on its own logger, since it's a separate process and
+    # can't share the caller's logging handlers directly.
+    profile_log_path: str | None = None
+
+    # S-curve smoothing applied to the goal position before dispatch. Without
+    # it, a raw teleop position is forwarded every send tick regardless of how
+    # far it moved, audible as jerk on MIT-mode joints. Disable for direct
+    # motor testing with enable_trajectory_smoothing=False.
+    enable_trajectory_smoothing: bool = True
+
+    # Per-joint smoothing time constant (motor order), in seconds: roughly how
+    # long the smoothed position takes to catch up to a step change in
+    # target. Must be meaningfully larger than the tick interval, or the
+    # per-tick gain (min(1, dt/tau)) degrades toward pass-through.
+    smoothing_time_constant_s: float | list[float] = 0.08
 
     # Soft joint limits (degrees). These are clipped against on every action.
     joint_limits: dict[str, tuple[float, float]] = field(

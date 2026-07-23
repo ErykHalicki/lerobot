@@ -140,12 +140,9 @@ class RebotArm102Leader(Teleoperator):
             self.bus.reset_multi_turn(motor_id)
 
     # sync_monitor() is fast (~3-5ms) for up to 4 servo ids in one call, but past
-    # that it starts intermittently stalling for ~100ms regardless of which ids
-    # are included -- not a bad servo, a batch-size limit in the sync command
-    # itself (see docs/b601_teleop_jitter_debug.md). Splitting into <=4-id
-    # chunks keeps every call in the fast regime, so all 7 servos still get
-    # read every tick at full rate instead of falling back to a lower refresh
-    # rate for some of them.
+    # that it intermittently stalls for ~100ms regardless of which ids are
+    # included -- a batch-size limit in the sync command itself. Splitting
+    # into <=4-id chunks keeps every call in the fast regime.
     _MAX_SYNC_MONITOR_IDS = 4
 
     def _read_raw_positions(self) -> dict[str, float]:

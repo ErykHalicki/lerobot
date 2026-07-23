@@ -114,11 +114,16 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
 def save_kwargs_for_path(fpath: Path, compress_level: int) -> dict:
     """Pick the right format-specific kwargs for :meth:`PIL.Image.Image.save`.
 
-    PNG uses ``compress_level`` (0-9, zlib). TIFF uses ``compression`` (raw) for lossless raw depth maps.
+    PNG uses ``compress_level`` (0-9, zlib). JPEG uses ``quality`` (0-100, lossy;
+    reuses the ``compress_level`` value as the quality setting, see
+    ``image_suffix``/``jpeg_quality`` on :class:`DatasetWriter`). TIFF uses
+    ``compression`` (raw) for lossless raw depth maps.
     """
     suffix = Path(fpath).suffix.lower()
     if suffix == ".png":
         return {"compress_level": compress_level}
+    if suffix in (".jpg", ".jpeg"):
+        return {"quality": compress_level}
     if suffix in (".tif", ".tiff"):
         return {"compression": "raw"}
     else:
@@ -132,8 +137,9 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
     This function handles both NumPy arrays and PIL Image objects, converting
     the former to a PIL Image before saving. It includes error handling for
     the save operation. The output format is inferred from the *fpath*
-    extension: ``.png`` → PNG with ``compress_level``, ``.tiff`` / ``.tif``
-    → lossless raw depth maps (TIFF).
+    extension: ``.png`` → PNG with ``compress_level``, ``.jpg``/``.jpeg`` → JPEG
+    with ``compress_level`` reused as ``quality``, ``.tiff`` / ``.tif`` →
+    lossless raw depth maps (TIFF).
 
     Args:
         image (np.ndarray | PIL.Image.Image): The image data to save.

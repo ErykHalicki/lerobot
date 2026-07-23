@@ -440,7 +440,11 @@ class OpenCVCamera(Camera):
         2. Stores result in latest_frame and updates timestamp (thread-safe)
         3. Sets new_frame_event to notify listeners
 
-        Stops on DeviceNotConnectedError, logs other errors and continues.
+        Stops on DeviceNotConnectedError (an intentional disconnect elsewhere).
+        Any other error is logged (throttled so a prolonged outage doesn't flood
+        the log) and retried indefinitely -- read_latest()/async_read() keep
+        serving the last good frame in the meantime, and the loop self-heals
+        (resumes fresh frames, no restart needed) once a read succeeds again.
         """
         stop_event = self.stop_event
         if stop_event is None:
@@ -457,16 +461,20 @@ class OpenCVCamera(Camera):
                     self.latest_frame = processed_frame
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
+                if failure_count > 0:
+                    logger.info(f"{self}: read succeeded again after {failure_count} failed attempt(s).")
                 failure_count = 0
 
             except DeviceNotConnectedError:
                 break
             except Exception as e:
-                if failure_count <= 10:
-                    failure_count += 1
-                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                failure_count += 1
+                if failure_count == 1 or failure_count % 30 == 0:
+                    logger.warning(
+                        f"{self}: frame read failed ({failure_count} consecutive failure(s)): {e}. "
+                        "Still retrying; serving the last known frame in the meantime."
+                    )
+                time.sleep(0.1)
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -478,15 +486,23 @@ class OpenCVCamera(Camera):
         self.thread.start()
         time.sleep(0.1)
 
-    def _stop_read_thread(self) -> None:
-        """Signals the background read thread to stop and waits for it to join."""
+    def _stop_read_thread(self) -> bool:
+        """Signals the background read thread to stop and waits for it to join.
+
+        Returns False if the thread is still alive after the timeout (it's stuck
+        inside a blocking OpenCV call, e.g. decoding a corrupted MJPEG frame), so
+        the caller knows it's not safe to touch the shared `videocapture` from
+        another thread.
+        """
         if self.stop_event is not None:
             self.stop_event.set()
 
+        stopped_cleanly = True
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
             if self.thread.is_alive():
                 logger.warning(f"{self} read thread did not terminate within timeout.")
+                stopped_cleanly = False
 
         self.thread = None
         self.stop_event = None
@@ -495,6 +511,8 @@ class OpenCVCamera(Camera):
             self.latest_frame = None
             self.latest_timestamp = None
             self.new_frame_event.clear()
+
+        return stopped_cleanly
 
     @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
@@ -586,11 +604,24 @@ class OpenCVCamera(Camera):
         if not self.is_connected and self.thread is None:
             raise DeviceNotConnectedError(f"{self} not connected.")
 
+        stopped_cleanly = True
         if self.thread is not None:
-            self._stop_read_thread()
+            stopped_cleanly = self._stop_read_thread()
 
         if self.videocapture is not None:
-            self.videocapture.release()
+            if stopped_cleanly:
+                self.videocapture.release()
+            else:
+                # The read thread is still stuck inside a blocking OpenCV call (seen with
+                # a corrupted MJPEG frame wedging the decoder). Calling release() here
+                # while that thread is still using the same VideoCapture can hang the
+                # whole process, so abandon the handle instead; the OS reclaims the fd
+                # when the process exits.
+                logger.warning(
+                    f"{self}: read thread did not stop cleanly, skipping videocapture.release() "
+                    "to avoid a concurrent-access hang. The device handle will leak until the "
+                    "process exits."
+                )
             self.videocapture = None
 
         with self.frame_lock:

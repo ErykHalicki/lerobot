@@ -70,6 +70,7 @@ lerobot-teleoperate \
 """
 
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
@@ -151,6 +152,11 @@ class TeleoperateConfig:
     display_compressed_images: bool = False
 
 
+# Shared with record_loop() (lerobot_record.py) so the two are directly comparable:
+# same logger name, same per-step timing convention.
+_PROFILE_LOGGER = logging.getLogger("lerobot.record_loop_profile")
+
+
 def teleop_loop(
     teleop: Teleoperator,
     robot: Robot,
@@ -186,18 +192,26 @@ def teleop_loop(
     start = time.perf_counter()
     while True:
         loop_start = time.perf_counter()
+        profiling = _PROFILE_LOGGER.isEnabledFor(logging.DEBUG)
+        step_times: dict[str, float] = {}
 
         # Get robot observation
         # Not really needed for now other than for visualization
         # teleop_action_processor can take None as an observation
         # given that it is the identity processor as default
+        t0 = time.perf_counter()
         obs = robot.get_observation()
+        if profiling:
+            step_times["get_observation"] = time.perf_counter() - t0
 
         if robot.name == "unitree_g1":
             teleop.send_feedback(obs)
 
         # Get teleop action
+        t0 = time.perf_counter()
         raw_action = teleop.get_action()
+        if profiling:
+            step_times["teleop.get_action"] = time.perf_counter() - t0
 
         # Process teleop action through pipeline
         teleop_action = teleop_action_processor((raw_action, obs))
@@ -206,7 +220,10 @@ def teleop_loop(
         robot_action_to_send = robot_action_processor((teleop_action, obs))
 
         # Send processed action to robot (robot_action_processor.to_output should return RobotAction)
+        t0 = time.perf_counter()
         _ = robot.send_action(robot_action_to_send)
+        if profiling:
+            step_times["robot.send_action"] = time.perf_counter() - t0
 
         if display_data:
             # Process robot observation through pipeline
@@ -227,6 +244,11 @@ def teleop_loop(
             move_cursor_up(len(robot_action_to_send) + 3)
 
         dt_s = time.perf_counter() - loop_start
+
+        if profiling:
+            step_times["total_loop"] = dt_s
+            _PROFILE_LOGGER.debug(" ".join(f"{name}={dur * 1000:.1f}ms" for name, dur in step_times.items()))
+
         time.sleep(max(1 / fps - dt_s, 0.0))
 
         if duration is not None and time.perf_counter() - start >= duration:
@@ -237,6 +259,23 @@ def teleop_loop(
 def teleoperate(cfg: TeleoperateConfig):
     init_logging()
     logging.info(pformat(asdict(cfg)))
+
+    # Ad hoc diagnostic: set LEROBOT_PROFILE_LOG to a file path to get the same
+    # per-step timing breakdown record_loop() supports (get_observation, teleop
+    # reads, send_action, ...), plus the robot's/teleop's own CAN-level debug logs,
+    # for comparing teleop_loop()'s timing against a record_loop() run.
+    profile_log = os.environ.get("LEROBOT_PROFILE_LOG")
+    if profile_log:
+        handler = logging.FileHandler(profile_log)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logging.getLogger().addHandler(handler)
+        for logger_name in (
+            "lerobot.record_loop_profile",
+            "lerobot.robots.rebot_b601_follower.rebot_b601_follower",
+            "lerobot.teleoperators.rebot_102_leader.rebot_102_leader",
+        ):
+            logging.getLogger(logger_name).setLevel(logging.DEBUG)
+        logging.info(f"Profiling teleop_loop() to {profile_log}")
     if cfg.display_data:
         init_visualization(
             cfg.display_mode, session_name="teleoperation", ip=cfg.display_ip, port=cfg.display_port

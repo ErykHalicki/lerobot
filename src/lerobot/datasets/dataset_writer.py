@@ -77,13 +77,11 @@ def _encode_video_worker(
     fps: int,
     video_encoder: VideoEncoderConfig | None = None,
     encoder_threads: int | None = None,
+    image_suffix: str = ".png",
 ) -> Path:
+    is_depth = video_encoder is not None and isinstance(video_encoder, DepthEncoderConfig)
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
-    path_template = (
-        DEFAULT_DEPTH_PATH
-        if video_encoder is not None and isinstance(video_encoder, DepthEncoderConfig)
-        else DEFAULT_IMAGE_PATH
-    )
+    path_template = DEFAULT_DEPTH_PATH if is_depth else DEFAULT_IMAGE_PATH.replace(".png", image_suffix)
     fpath = path_template.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     encode_video_frames(
@@ -93,6 +91,7 @@ def _encode_video_worker(
         video_encoder=video_encoder,
         encoder_threads=encoder_threads,
         overwrite=True,
+        image_suffix=None if is_depth else image_suffix,
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -115,6 +114,8 @@ class DatasetWriter:
         batch_encoding_size: int,
         streaming_encoder: StreamingVideoEncoder | None = None,
         initial_frames: int = 0,
+        image_suffix: str = ".png",
+        jpeg_quality: int = 90,
     ):
         """Initialize the writer with metadata, codec, and encoder config.
 
@@ -134,6 +135,13 @@ class DatasetWriter:
             streaming_encoder: Optional pre-built :class:`StreamingVideoEncoder`
                 for real-time encoding. ``None`` disables streaming mode.
             initial_frames: Starting frame count (non-zero when resuming).
+            image_suffix: Intermediate per-frame file format for RGB (non-depth)
+                images written before ``save_episode()`` batch-encodes them into
+                video, e.g. ``".png"`` (default, lossless) or ``".jpg"`` (much
+                cheaper to encode). Depth frames always use ``.tiff`` regardless
+                of this setting.
+            jpeg_quality: PIL JPEG ``quality`` (0-100) used when ``image_suffix``
+                is ``.jpg``/``.jpeg``. Ignored otherwise.
         """
         self._meta = meta
         self._root = root
@@ -142,6 +150,8 @@ class DatasetWriter:
         self._encoder_threads = encoder_threads
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
+        self._image_suffix = image_suffix
+        self._jpeg_quality = jpeg_quality
 
         # Writer state
         self.image_writer: AsyncImageWriter | None = None
@@ -163,7 +173,10 @@ class DatasetWriter:
         return ep_buffer
 
     def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
-        path_template = DEFAULT_DEPTH_PATH if image_key in self._meta.depth_keys else DEFAULT_IMAGE_PATH
+        if image_key in self._meta.depth_keys:
+            path_template = DEFAULT_DEPTH_PATH
+        else:
+            path_template = DEFAULT_IMAGE_PATH.replace(".png", self._image_suffix)
         fpath = path_template.format(
             image_key=image_key, episode_index=episode_index, frame_index=frame_index
         )
@@ -243,7 +256,10 @@ class DatasetWriter:
                 )
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
-                compress_level = 1 if self._meta.features[key]["dtype"] == "video" else 6
+                if self._image_suffix in (".jpg", ".jpeg"):
+                    compress_level = self._jpeg_quality
+                else:
+                    compress_level = 1 if self._meta.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
                 self.episode_buffer[key].append(str(img_path))
             else:
@@ -334,6 +350,7 @@ class DatasetWriter:
                             self._meta.fps,
                             self._depth_encoder if video_key in self._meta.depth_keys else self._rgb_encoder,
                             self._encoder_threads,
+                            self._image_suffix,
                         ): video_key
                         for video_key in self._meta.video_keys
                     }
@@ -615,7 +632,7 @@ class DatasetWriter:
             self.image_writer.wait_until_done()
 
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
-        """Use ffmpeg to convert frames stored as png/tiff into mp4 videos."""
+        """Use ffmpeg to convert frames stored as png/jpg/tiff into mp4 videos."""
         is_depth = video_key in self._meta.depth_keys
         return _encode_video_worker(
             video_key,
@@ -624,6 +641,7 @@ class DatasetWriter:
             self._meta.fps,
             self._depth_encoder if is_depth else self._rgb_encoder,
             self._encoder_threads,
+            self._image_suffix,
         )
 
     def close_writer(self) -> None:

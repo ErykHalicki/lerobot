@@ -442,17 +442,19 @@ def encode_video_frames(
     *,
     log_level: int | None = av.logging.WARNING,
     overwrite: bool = False,
+    image_suffix: str | None = None,
 ) -> None:
     """Encode a directory of image frames into an MP4 video.
 
     When ``video_encoder`` is a :class:`~lerobot.configs.video.DepthEncoderConfig`,
     frames are read from ``.tiff`` files and quantized to 12-bit depth codes using the
-    encoder's ``depth_min`` / ``depth_max`` / ``shift`` / ``use_log``; otherwise ``.png``
-    RGB frames are encoded directly.
+    encoder's ``depth_min`` / ``depth_max`` / ``shift`` / ``use_log``; otherwise RGB
+    frames (``.png`` by default, or ``image_suffix`` if given) are encoded directly.
+    PIL (used to reload each frame) reads either format transparently.
 
     Args:
         imgs_dir: Directory containing the frames to encode, named ``frame-000000``
-            onwards (``.png`` for RGB, ``.tiff`` for depth).
+            onwards (``.png``/``image_suffix`` for RGB, ``.tiff`` for depth).
         video_path: Output path for the encoded ``.mp4`` file.
         fps: Frame rate of the output video.
         video_encoder: Encoder settings (codec, pixel format, quality, ...). When
@@ -464,6 +466,8 @@ def encode_video_frames(
             current logging configuration unchanged.
         overwrite: When ``False`` and ``video_path`` already exists, skip encoding and
             log a warning. When ``True``, re-encode and replace the existing file.
+        image_suffix: RGB frame file extension to look for (e.g. ``".jpg"``). Ignored
+            for depth (always ``.tiff``). ``None`` defaults to ``.png``.
     """
     if video_encoder is None:
         video_encoder = rgb_encoder_defaults()
@@ -481,7 +485,7 @@ def encode_video_frames(
 
     # Get input frames
     is_depth = isinstance(video_encoder, DepthEncoderConfig)
-    suffix = ".png" if not is_depth else ".tiff"
+    suffix = ".tiff" if is_depth else (image_suffix or ".png")
     template = "frame-" + ("[0-9]" * 6) + suffix
     input_list = sorted(
         glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
@@ -1286,13 +1290,15 @@ class VideoEncodingManager:
         img_dir = self.dataset.root / "images"
         if img_dir.exists():
             png_files = list(img_dir.rglob("*.png"))
+            jpg_files = list(img_dir.rglob("*.jpg")) + list(img_dir.rglob("*.jpeg"))
             tiff_files = list(img_dir.rglob("*.tiff"))
-            if len(png_files) == 0 and len(tiff_files) == 0:
+            if len(png_files) == 0 and len(jpg_files) == 0 and len(tiff_files) == 0:
                 shutil.rmtree(img_dir)
                 logger.debug("Cleaned up empty images directory")
             else:
                 logger.debug(
-                    f"Images directory is not empty, containing {len(png_files)} PNG and {len(tiff_files)} TIFF files"
+                    f"Images directory is not empty, containing {len(png_files)} PNG, "
+                    f"{len(jpg_files)} JPEG and {len(tiff_files)} TIFF files"
                 )
 
         return False  # Don't suppress the original exception

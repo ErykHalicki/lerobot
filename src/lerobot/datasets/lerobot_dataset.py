@@ -681,6 +681,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         video_files_size_in_mb: int | None = None,
         data_files_size_in_mb: int | None = None,
+        image_suffix: str = ".png",
+        jpeg_quality: int = 90,
     ) -> "LeRobotDataset":
         """Create a new LeRobotDataset from scratch for recording data.
 
@@ -717,6 +719,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 during capture instead of writing images first.
             encoder_queue_maxsize: Max buffered frames per camera when using
                 streaming encoding.
+            image_suffix: Intermediate per-frame file format for RGB images
+                written before ``save_episode()`` batch-encodes them into video
+                (ignored with ``streaming_encoding``). ``".png"`` (default) is
+                lossless; ``".jpg"``/``".jpeg"`` is much cheaper to encode at
+                the cost of a small, one-time generational quality loss in the
+                temp files (the final video is still re-encoded from them).
+                Depth frames always use ``.tiff`` regardless of this setting.
+            jpeg_quality: PIL JPEG ``quality`` (0-100), used when ``image_suffix``
+                is ``.jpg``/``.jpeg``. Ignored otherwise.
 
         Returns:
             A new :class:`LeRobotDataset` in write mode.
@@ -763,6 +774,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encoder_threads=encoder_threads,
             batch_encoding_size=batch_encoding_size,
             streaming_encoder=streaming_enc,
+            image_suffix=image_suffix,
+            jpeg_quality=jpeg_quality,
         )
 
         if image_writer_processes or image_writer_threads:
@@ -789,6 +802,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         image_writer_threads: int = 0,
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
+        image_suffix: str = ".png",
+        jpeg_quality: int = 90,
     ) -> "LeRobotDataset":
         """Resume recording on an existing dataset.
 
@@ -822,6 +837,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
             streaming_encoding: If ``True``, encode video in real-time during
                 capture.
             encoder_queue_maxsize: Max buffered frames per camera for streaming.
+            image_suffix: Intermediate per-frame file format for RGB images
+                written before ``save_episode()`` batch-encodes them into video.
+                See :meth:`create` for details.
+            jpeg_quality: PIL JPEG ``quality`` (0-100), used when ``image_suffix``
+                is ``.jpg``/``.jpeg``. Ignored otherwise.
 
         Returns:
             A :class:`LeRobotDataset` in write mode, ready to append episodes.
@@ -873,6 +893,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             batch_encoding_size=batch_encoding_size,
             streaming_encoder=streaming_enc,
             initial_frames=obj.meta.total_frames,
+            image_suffix=image_suffix,
+            jpeg_quality=jpeg_quality,
         )
 
         if image_writer_processes or image_writer_threads:

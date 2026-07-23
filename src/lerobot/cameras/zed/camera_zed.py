@@ -21,6 +21,7 @@ stereo cameras via py-zed-open-capture (no CUDA/ZED SDK required).
 
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from numpy.typing import NDArray
@@ -50,8 +51,16 @@ class _ZedDevice:
     only opened once and reference-counted across the two `ZedCamera.connect()`/
     `disconnect()` calls, rather than trying to open the same /dev/video node twice.
 
-    The decoded BGR frame is cached by `frame_id` so polling both eyes back-to-back
-    (the common case in a control loop) only pays for one YUV->BGR conversion.
+    A background thread is the sole caller of the native `get_last_frame()` (which
+    blocks until the SDK has a new frame, ~1/fps per call): it continuously grabs
+    and decodes frames into a shared buffer, so both eyes' `read_latest()` calls
+    are non-blocking peeks of that buffer (matching `OpenCVCamera`'s async-read
+    pattern) instead of each independently blocking for a fresh SDK frame. Without
+    this, polling both eyes back-to-back in a control loop -- the common case --
+    roughly halved the achievable loop rate, since each blocked ~1/fps in turn.
+    `read()`/`async_read()` still block, but now by waiting on the background
+    thread's buffer update rather than calling the SDK directly, so only one
+    thread ever touches the native capture handle.
     """
 
     _registry: dict[str, "_ZedDevice"] = {}
@@ -68,6 +77,13 @@ class _ZedDevice:
         self._cap: Any = None
         self._cached_frame_id: int | None = None
         self._cached_bgr: NDArray[Any] | None = None
+        self._latest_timestamp: float | None = None
+        self._new_frame_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+
+    def __str__(self) -> str:
+        return f"_ZedDevice(serial={self.serial_number or 'auto'})"
 
     @classmethod
     def acquire(cls, key: str, serial_number: str | None, width: int, height: int, fps: int) -> "_ZedDevice":
@@ -112,6 +128,8 @@ class _ZedDevice:
             self._cap = cap
             self._cached_frame_id = None
             self._cached_bgr = None
+            self._latest_timestamp = None
+        self._start_read_thread()
 
     def _resolve_dev_id(self) -> int:
         if self.serial_number is None:
@@ -122,31 +140,108 @@ class _ZedDevice:
         raise ConnectionError(f"No ZED camera found with serial number {self.serial_number!r}.")
 
     def _close(self) -> None:
+        # Stopped without holding self._lock: the read loop takes self._lock itself
+        # to snapshot self._cap each iteration, so holding it across the join here
+        # would deadlock against a thread blocked trying to acquire it.
+        self._stop_read_thread()
         with self._lock:
             self._cap = None  # no explicit close in the native API; dropping the last
             # reference stops its capture thread and releases the device fd
             self._cached_frame_id = None
             self._cached_bgr = None
+            self._latest_timestamp = None
 
     @property
     def is_connected(self) -> bool:
         return self._cap is not None
 
-    def get_frame(self, timeout_ms: int) -> NDArray[Any]:
-        with self._lock:
-            cap = self._cap
-        if cap is None:
-            raise RuntimeError("_ZedDevice.get_frame() called before connect().")
+    def _read_loop(self) -> None:
+        """Background thread: the only caller of the native (blocking) capture API.
+        Continuously grabs and decodes frames into the shared buffer that
+        `get_frame()` and `get_latest_frame()` read from. Read failures are
+        logged (throttled) and retried indefinitely rather than killing the
+        thread, so a flaky camera self-heals once it starts responding again
+        instead of permanently breaking every subsequent read."""
+        stop_event = self._stop_event
+        if stop_event is None:
+            raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
-        frame = cap.get_last_frame(timeout_ms)
-        if frame is None:
+        failure_count = 0
+        while not stop_event.is_set():
+            with self._lock:
+                cap = self._cap
+            if cap is None:
+                break
+            try:
+                frame = cap.get_last_frame(1000)
+                if frame is None:
+                    continue  # no new frame within the timeout; keep polling
+                bgr = zoc.to_bgr(frame)
+                with self._lock:
+                    self._cached_bgr = bgr
+                    self._cached_frame_id = frame.frame_id
+                    self._latest_timestamp = time.perf_counter()
+                self._new_frame_event.set()
+                if failure_count > 0:
+                    logger.info(f"{self}: read succeeded again after {failure_count} failed attempt(s).")
+                failure_count = 0
+            except Exception as e:
+                failure_count += 1
+                if failure_count == 1 or failure_count % 30 == 0:
+                    logger.warning(
+                        f"{self}: frame read failed ({failure_count} consecutive failure(s)): {e}. "
+                        "Still retrying; serving the last known frame in the meantime."
+                    )
+                time.sleep(0.1)
+
+    def _start_read_thread(self) -> None:
+        """Starts or restarts the background read thread if it's not running."""
+        self._stop_read_thread()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._read_loop, name=f"{self}_read_loop", daemon=True)
+        self._thread.start()
+
+    def _stop_read_thread(self) -> None:
+        """Signals the background read thread to stop and waits for it to join."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                logger.warning(f"{self} read thread did not terminate within timeout.")
+        self._thread = None
+        self._stop_event = None
+        self._new_frame_event.clear()
+
+    def get_frame(self, timeout_ms: int) -> NDArray[Any]:
+        """Blocks until the background thread delivers a frame newer than the one
+        returned by the previous call (or times out). Used by `read()`/`async_read()`."""
+        if self._thread is None or not self._thread.is_alive():
+            raise RuntimeError(f"{self}: read thread is not running.")
+
+        self._new_frame_event.clear()
+        if not self._new_frame_event.wait(timeout=timeout_ms / 1000.0):
             raise TimeoutError(f"Timed out waiting for a ZED frame after {timeout_ms} ms.")
 
         with self._lock:
-            if self._cached_frame_id != frame.frame_id:
-                self._cached_bgr = zoc.to_bgr(frame)
-                self._cached_frame_id = frame.frame_id
+            if self._cached_bgr is None:
+                raise RuntimeError(f"Internal error: {self} event set but no frame available.")
             return self._cached_bgr
+
+    def get_latest_frame(self, max_age_ms: int) -> NDArray[Any]:
+        """Non-blocking: returns whatever the background thread most recently
+        buffered, regardless of whether it's new since the last call. Used by
+        `read_latest()`."""
+        with self._lock:
+            frame = self._cached_bgr
+            timestamp = self._latest_timestamp
+        if frame is None or timestamp is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+
+        age_ms = (time.perf_counter() - timestamp) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms).")
+        return frame
 
 
 def find_zed_cameras() -> list[dict[str, Any]]:
@@ -275,6 +370,14 @@ class ZedCamera(Camera):
         """Returns the latest frame (this eye only). See `Camera.async_read`."""
         assert self._device is not None
         return self._crop(self._device.get_frame(int(timeout_ms)))
+
+    @check_if_not_connected
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
+        """Return the most recent frame (this eye only), non-blocking. See
+        `Camera.read_latest`; unlike the base class default, this doesn't fall
+        back to `async_read()` and so never blocks on the camera hardware."""
+        assert self._device is not None
+        return self._crop(self._device.get_latest_frame(max_age_ms))
 
     def disconnect(self) -> None:
         if self._device is None:
