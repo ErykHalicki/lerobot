@@ -59,6 +59,7 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        decode_unrequested_videos: bool = True,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -80,6 +81,12 @@ class DatasetReader:
                 instead of normalized float32.
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
+            decode_unrequested_videos: If True (default), video streams absent
+                from ``delta_timestamps`` are still decoded at the current
+                frame's timestamp. If False, they are skipped entirely and left
+                out of the returned item. Only takes effect when
+                ``delta_timestamps`` is provided; without it every video stream
+                is decoded as before.
         """
         self._meta = meta
         self.root = root
@@ -91,6 +98,7 @@ class DatasetReader:
         self._image_transforms = image_transforms
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
+        self._decode_unrequested_videos = decode_unrequested_videos
 
         self.hf_dataset: datasets.Dataset | None = None
         self._absolute_to_relative_idx: dict[int, int] | None = None
@@ -245,7 +253,7 @@ class DatasetReader:
                 else:
                     timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
                 query_timestamps[key] = torch.stack(timestamps).tolist()
-            else:
+            elif query_indices is None or self._decode_unrequested_videos:
                 query_timestamps[key] = [current_ts]
 
         return query_timestamps
@@ -336,7 +344,7 @@ class DatasetReader:
 
         if self._image_transforms is not None:
             for cam in self._meta.camera_keys:
-                if cam in self._meta.depth_keys:
+                if cam in self._meta.depth_keys or cam not in item:
                     continue
                 item[cam] = self._image_transforms(item[cam])
 
