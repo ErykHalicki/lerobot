@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import logging
 import math
 import multiprocessing
@@ -44,6 +45,9 @@ logger = logging.getLogger(__name__)
 
 # Joint controlled in FORCE_POS mode; every other joint runs in POS_VEL mode.
 GRIPPER_MOTOR = "gripper"
+# Wrist pitch, held clear of the shoulder during the ramp home. Negative angles
+# point the gripper up on this arm.
+WRIST_MOTOR = "wrist_flex"
 # Per-joint Damiao motor models for the B601-DM (passed to motorbridge).
 MOTOR_MODELS = {
     "shoulder_pan": "4340P",
@@ -57,6 +61,10 @@ MOTOR_MODELS = {
 _ENSURE_MODE_RETRIES = 9
 _SETTLE_SEC = 0.01
 _ZERO_SETTLE_SEC = 0.1
+# Held at the end of _go_home(). The motor (and the smoother ahead of it) trails
+# the goal, and disconnect() stops the follower process the instant _go_home()
+# returns, which would otherwise cut the gripper off part-closed.
+_GRIPPER_SETTLE_SEC = 0.5
 
 
 class _SCurveAxis:
@@ -104,6 +112,9 @@ def _follower_process_main(
     present_pos_ts,
     last_sent_shared,
     has_sent_ever,
+    mit_kp_shared,
+    mit_kd_shared,
+    tau_ff_shared,
     command_queue: multiprocessing.Queue,
     ready_event,
     stop_event,
@@ -114,6 +125,7 @@ def _follower_process_main(
     process can delay it by holding the GIL.
 
     Communicates via shared memory only: `goal_pos_shared` (target),
+    `mit_kp_shared`/`mit_kd_shared`/`tau_ff_shared` (how hard to chase it),
     `present_pos_shared`/`present_torq_shared`/`present_vel_shared`/
     `present_pos_ts` (latest reading), `last_sent_shared` (what was actually
     sent). `command_queue` carries disable/enable/clear_error.
@@ -237,13 +249,15 @@ def _follower_process_main(
                     motor = motors.get(name)
                     if motor is None:
                         continue
-                    idx = motor_names.index(name)
+                    idx = i
                     pos_rad = math.radians(smoothed_pos[name])
                     vel_rad_s = math.radians(smoothed_vel[name])
                     try:
                         if name == GRIPPER_MOTOR:
                             if config.gripper_control_mode == "mit":
-                                motor.send_mit(pos_rad, vel_rad_s, config.gripper_mit_kp, config.gripper_mit_kd, 0.0)
+                                motor.send_mit(
+                                    pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau_ff_shared[i]
+                                )
                             else:
                                 vel_deg_s = (
                                     config.pos_vel_velocity[idx]
@@ -252,9 +266,9 @@ def _follower_process_main(
                                 )
                                 motor.send_force_pos(pos_rad, math.radians(vel_deg_s), config.gripper_torque_ratio)
                         elif use_mit:
-                            kp = config.mit_kp[idx] if isinstance(config.mit_kp, list) else config.mit_kp
-                            kd = config.mit_kd[idx] if isinstance(config.mit_kd, list) else config.mit_kd
-                            motor.send_mit(pos_rad, vel_rad_s, kp, kd, 0.0)
+                            motor.send_mit(
+                                pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau_ff_shared[i]
+                            )
                         else:
                             vel_deg_s = (
                                 config.pos_vel_velocity[idx]
@@ -336,6 +350,13 @@ class RebotB601Follower(Robot):
         # Smoothed position actually sent, read by send_action()'s return value.
         self._last_sent_shared = self._mp_ctx.Array("d", n, lock=False)
         self._has_sent_ever = self._mp_ctx.Value("b", 0, lock=False)
+        # MIT gains and feedforward torque, read every tick alongside the goal.
+        # Resolved to one entry per motor here, so the send loop is a plain
+        # indexed read and set_mit_gains() can retune a live arm.
+        self._mit_kp_shared = self._mp_ctx.Array("d", n, lock=False)
+        self._mit_kd_shared = self._mp_ctx.Array("d", n, lock=False)
+        self._tau_ff_shared = self._mp_ctx.Array("d", n, lock=False)
+        self._reset_mit_gains()
         # Rare control messages; doesn't need shared-memory speed.
         self._command_queue = self._mp_ctx.Queue()
         self._ready_event = self._mp_ctx.Event()
@@ -388,6 +409,26 @@ class RebotB601Follower(Robot):
         # Temporary connection: only used for calibration and configure().
         # Closed below and handed off to the follower process, which reopens
         # its own.
+        self._open_bus()
+
+        if not self.is_calibrated and calibrate:
+            logger.info(
+                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+            )
+            self.calibrate()
+
+        for cam in self.cameras.values():
+            cam.connect()
+
+        self.configure()
+
+        self._close_bus()
+
+        self._start_follower_process()
+        logger.info(f"{self} connected.")
+
+    def _open_bus(self) -> None:
+        """Open a direct connection to the motors and register them."""
         if self.config.can_adapter == "damiao":
             self.bus = MotorBridgeController.from_dm_serial(
                 serial_port=self.config.port,
@@ -403,31 +444,48 @@ class RebotB601Follower(Robot):
         for motor_name, (send_id, recv_id) in self.config.motor_can_ids.items():
             self.motors[motor_name] = self.bus.add_damiao_motor(send_id, recv_id, MOTOR_MODELS[motor_name])
 
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+    def _close_bus(self) -> None:
+        """Release the direct connection, leaving the device free to reopen.
 
-        for cam in self.cameras.values():
-            cam.connect()
-
-        self.configure()
-
-        # Close each motor before the bus: skipping this can leave the serial
-        # device open, so the follower process's own open fails with "Device
-        # or resource busy".
+        Each motor is closed before the bus: skipping that can leave the serial
+        device open, so the next open fails with "Device or resource busy". The
+        short sleep gives the OS time to release it -- the follower process also
+        retries on its own.
+        """
         for motor in self.motors.values():
-            motor.close()
-        self.bus.close()
+            with contextlib.suppress(Exception):
+                motor.close()
+        if self.bus is not None:
+            self.bus.close()
         self.bus = None
         self.motors = {}
-        # Short settle for the OS to release the serial device; the follower
-        # process also retries on its own.
         time.sleep(0.3)
 
-        self._start_follower_process()
-        logger.info(f"{self} connected.")
+    @contextlib.contextmanager
+    def _direct_connection(self):
+        """Own the motors directly for the duration of the block.
+
+        connect() already holds such a connection while it calibrates and
+        configures, so this is a no-op there. Anything called *after* connect()
+        has to take the device back from the follower process, which owns it by
+        then -- lerobot-calibrate does exactly that: connect(calibrate=False)
+        followed by calibrate().
+        """
+        if self.bus is not None:
+            yield
+            return
+
+        running = self._follower_process is not None and self._follower_process.is_alive()
+        if running:
+            self._stop_follower_process()
+            time.sleep(0.3)
+        try:
+            self._open_bus()
+            yield
+        finally:
+            self._close_bus()
+            if running:
+                self._start_follower_process()
 
     @property
     def is_calibrated(self) -> bool:
@@ -444,18 +502,22 @@ class RebotB601Follower(Robot):
                 return
 
         logger.info(f"\nRunning calibration of {self}")
-        self.bus.disable_all()
-        print(
-            "\nCalibration: set zero position.\n"
-            "Manually move the reBot B601 to its ZERO POSITION and close the gripper.\n"
-            "See the B601 manual for the zero pose (the default sit-down position).\n"
-        )
-        input("Press ENTER when ready...")
+        # Zeroing writes to the motors directly, so this needs the connection
+        # back from the follower process when called on an already-connected
+        # robot (lerobot-calibrate's connect-then-calibrate order).
+        with self._direct_connection():
+            self.bus.disable_all()
+            print(
+                "\nCalibration: set zero position.\n"
+                "Manually move the reBot B601 to its ZERO POSITION and close the gripper.\n"
+                "See the B601 manual for the zero pose (the default sit-down position).\n"
+            )
+            input("Press ENTER when ready...")
 
-        for motor in self.motors.values():
-            motor.set_zero_position()
-            time.sleep(_ZERO_SETTLE_SEC)
-        logger.info("Arm zero position set.")
+            for motor in self.motors.values():
+                motor.set_zero_position()
+                time.sleep(_ZERO_SETTLE_SEC)
+            logger.info("Arm zero position set.")
 
         self.calibration = {}
         for motor_name, (send_id, _recv_id) in self.config.motor_can_ids.items():
@@ -538,6 +600,80 @@ class RebotB601Follower(Robot):
         self._command_queue.put("clear_error")
         self._command_queue.put("enable")
         logger.info(f"{self} torque enabled.")
+
+    def _write_per_motor(self, shared, value: float | list[float] | dict[str, float]) -> None:
+        """Write a scalar / motor-ordered list / name-keyed dict into a shared
+        array. A dict updates only the motors it names, leaving the others as
+        they are, so a caller can retune one joint without restating the rest.
+        """
+        if isinstance(value, dict):
+            unknown = set(value) - set(self.motor_names)
+            if unknown:
+                raise ValueError(f"{self}: unknown motor(s) {sorted(unknown)}")
+            for i, name in enumerate(self.motor_names):
+                if name in value:
+                    shared[i] = float(value[name])
+            return
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(self.motor_names):
+                raise ValueError(f"{self}: expected {len(self.motor_names)} values, got {len(value)}")
+            for i, v in enumerate(value):
+                shared[i] = float(v)
+            return
+        for i in range(len(self.motor_names)):
+            shared[i] = float(value)
+
+    def _reset_mit_gains(self) -> None:
+        """Load the configured MIT gains into shared memory, the gripper's own
+        pair included, so the send loop never has to consult the config."""
+        self._write_per_motor(self._mit_kp_shared, self.config.mit_kp)
+        self._write_per_motor(self._mit_kd_shared, self.config.mit_kd)
+        self._write_per_motor(self._mit_kp_shared, {GRIPPER_MOTOR: self.config.gripper_mit_kp})
+        self._write_per_motor(self._mit_kd_shared, {GRIPPER_MOTOR: self.config.gripper_mit_kd})
+
+    def set_mit_gains(
+        self,
+        kp: float | list[float] | dict[str, float] | None = None,
+        kd: float | list[float] | dict[str, float] | None = None,
+    ) -> None:
+        """Retune the MIT gains the follower process sends, without a reconnect.
+
+        Takes effect on the process's next tick. Passing neither restores the
+        configured gains, so a caller that lowered them can always put them
+        back. Only meaningful under control_mode="mit" (and, for the gripper,
+        gripper_control_mode="mit"); POS_VEL and FORCE_POS ignore these.
+
+        Dropping kp to 0 leaves a joint carried by kd damping and whatever
+        set_torque_feedforward() supplies -- that is gravity compensation.
+        """
+        if kp is None and kd is None:
+            self._reset_mit_gains()
+            logger.info(f"{self} MIT gains restored to their configured values.")
+            return
+        if kp is not None:
+            self._write_per_motor(self._mit_kp_shared, kp)
+        if kd is not None:
+            self._write_per_motor(self._mit_kd_shared, kd)
+
+    def get_mit_gains(self) -> tuple[dict[str, float], dict[str, float]]:
+        """The (kp, kd) the follower process is currently sending, by motor
+        name. Read before lowering them to have something to restore to."""
+        return (
+            {name: self._mit_kp_shared[i] for i, name in enumerate(self.motor_names)},
+            {name: self._mit_kd_shared[i] for i, name in enumerate(self.motor_names)},
+        )
+
+    def set_torque_feedforward(self, torque: dict[str, float] | None = None) -> None:
+        """Set the feedforward torque (N.m) added to every MIT command, by
+        motor name. Passing nothing clears it back to zero.
+
+        Like send_action(), this only updates shared memory: the follower
+        process keeps applying the last value at its own fixed rate, so a
+        stall in the caller's loop holds the arm rather than dropping it.
+        Motors named here keep their previous feedforward, so a caller can
+        drive one joint without restating the rest.
+        """
+        self._write_per_motor(self._tau_ff_shared, 0.0 if torque is None else torque)
 
     def _present_pos(self) -> dict[str, float]:
         """Read present joint positions in degrees from the follower
@@ -681,6 +817,9 @@ class RebotB601Follower(Robot):
                 self._present_pos_ts,
                 self._last_sent_shared,
                 self._has_sent_ever,
+                self._mit_kp_shared,
+                self._mit_kd_shared,
+                self._tau_ff_shared,
                 self._command_queue,
                 self._ready_event,
                 self._stop_event,
@@ -737,19 +876,47 @@ class RebotB601Follower(Robot):
                 return
             time.sleep(tick)
 
+    def _hold(self, targets: dict[str, float], duration: float) -> None:
+        """Keep commanding a fixed target for `duration` seconds, giving the
+        motors time to actually arrive at a goal the ramp already reached."""
+        tick = 1.0 / self.config.send_rate_hz
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            self.send_action({f"{name}.pos": value for name, value in targets.items()})
+            time.sleep(tick)
+
     def _go_home(self) -> None:
         """Ramp every joint to 0° (the calibration zero pose) over
-        `home_duration_s`, except the gripper: it opens all the way during
-        that same ramp (so it can't be gripping anything while the arm
-        moves), then closes to 0° afterward over `gripper_close_duration_s`."""
+        `home_duration_s`, except the gripper and the wrist.
+
+        The gripper opens all the way during that ramp, so it can't be gripping
+        anything while the arm moves. The wrist holds `home_wrist_flex_deg`
+        instead of 0° for the same span, pointing the gripper up and out of the
+        shoulder's way -- coming in flat swings whatever is on the end into the
+        shoulder at full ramp speed.
+
+        Both then finish together over `gripper_close_duration_s`: the gripper
+        closes to 0° while the wrist lowers to 0°, so the load is set down over
+        the whole close rather than dropped at the end of it.
+
+        A short hold follows, since both are still travelling when their goals
+        stop moving and the caller (disconnect()) shuts the follower process
+        down as soon as this returns.
+        """
         start = self._present_pos()
         gripper_open = self.config.joint_limits[GRIPPER_MOTOR][0]
+        wrist_up = self.config.home_wrist_flex_deg
 
         targets = {name: (start[name], 0.0) for name in self.motor_names if name != GRIPPER_MOTOR}
         targets[GRIPPER_MOTOR] = (start[GRIPPER_MOTOR], gripper_open)
+        targets[WRIST_MOTOR] = (start[WRIST_MOTOR], wrist_up)
         self._ramp(targets, self.config.home_duration_s)
 
-        self._ramp({GRIPPER_MOTOR: (gripper_open, 0.0)}, self.config.gripper_close_duration_s)
+        self._ramp(
+            {GRIPPER_MOTOR: (gripper_open, 0.0), WRIST_MOTOR: (wrist_up, 0.0)},
+            self.config.gripper_close_duration_s,
+        )
+        self._hold({GRIPPER_MOTOR: 0.0, WRIST_MOTOR: 0.0}, _GRIPPER_SETTLE_SEC)
 
     @check_if_not_connected
     def disconnect(self) -> None:

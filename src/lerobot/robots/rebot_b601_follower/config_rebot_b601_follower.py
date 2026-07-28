@@ -55,8 +55,15 @@ class RebotB601FollowerConfig:
     home_duration_s: float = 5.0
 
     # Time to spend closing the gripper to 0° after home_duration_s, once
-    # every other joint (and the gripper itself, fully open) has arrived.
+    # every other joint (and the gripper itself, fully open) has arrived. The
+    # wrist lowers from home_wrist_flex_deg to 0° over this same span.
     gripper_close_duration_s: float = 2.0
+
+    # Where to hold wrist_flex while the arm ramps home, in degrees; negative
+    # points the gripper up. Keeps whatever is on the end clear of the shoulder
+    # on the way in, then lowers to 0° over gripper_close_duration_s rather than
+    # swinging down at ramp speed. 0.0 homes the wrist with everything else.
+    home_wrist_flex_deg: float = -45.0
 
     # `max_relative_target` limits the magnitude of the relative positional target
     # vector for safety purposes (in degrees). Set to a positive scalar to apply the
@@ -121,7 +128,7 @@ class RebotB601FollowerConfig:
     # long the smoothed position takes to catch up to a step change in
     # target. Must be meaningfully larger than the tick interval, or the
     # per-tick gain (min(1, dt/tau)) degrades toward pass-through.
-    smoothing_time_constant_s: float | list[float] = 0.08
+    smoothing_time_constant_s: float | list[float] = 0.04
 
     # Soft joint limits (degrees). These are clipped against on every action.
     joint_limits: dict[str, tuple[float, float]] = field(
