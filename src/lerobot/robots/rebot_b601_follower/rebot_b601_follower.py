@@ -25,6 +25,8 @@ import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import MotorCalibration
 from lerobot.types import RobotAction, RobotObservation
@@ -33,6 +35,7 @@ from lerobot.utils.import_utils import _motorbridge_available, require_package
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
+from . import gravity_model
 from .config_rebot_b601_follower import RebotB601FollowerRobotConfig
 
 if TYPE_CHECKING or _motorbridge_available:
@@ -99,6 +102,61 @@ class _SCurveAxis:
         self._s3 += a * (self._s2 - self._s3)
         vel = (self._s3 - prev_s3) / dt if dt > 0 else 0.0
         return self._s3, vel
+
+
+class _GravityCompensator:
+    """Turns the joint angles read each tick into the torque that holds the arm
+    up, in the follower process's motor order.
+
+    Resolves the joint order, trim and clamp once at construction, so the send
+    loop only pays for the model itself.
+
+    Disabled config, a non-MIT arm, or a motor layout the model does not cover
+    all yield zeros, so the send loop needs no special case.
+    """
+
+    def __init__(self, config: RebotB601FollowerRobotConfig, motor_names: list[str]):
+        self._zeros = [0.0] * len(motor_names)
+        self.enabled = config.gravity_compensation and config.control_mode == "mit"
+        if self.enabled and not set(gravity_model.JOINT_NAMES) <= set(motor_names):
+            missing = sorted(set(gravity_model.JOINT_NAMES) - set(motor_names))
+            logger.warning(f"Gravity compensation off: no {missing} in motor_can_ids.")
+            self.enabled = False
+        if not self.enabled:
+            return
+
+        unknown = set(config.gravity_scale) - set(gravity_model.JOINT_NAMES)
+        if unknown:
+            raise ValueError(
+                f"gravity_scale names {sorted(unknown)} are not arm joints; "
+                f"pick from {list(gravity_model.JOINT_NAMES)}"
+            )
+        self._scale = np.array(
+            [config.gravity_scale.get(name, 1.0) for name in gravity_model.JOINT_NAMES]
+        ) * config.gravity_gain
+        self._limit = np.minimum(gravity_model.EFFORT_LIMITS, config.gravity_max_torque)
+        self._payload = config.gravity_payload_kg
+        self._payload_com = tuple(config.gravity_payload_com)
+        # Where each modelled joint sits in the motor order the loop indexes by.
+        self._slots = [motor_names.index(name) for name in gravity_model.JOINT_NAMES]
+
+    def torques(self, present_pos_deg) -> list[float]:
+        """Holding torque per motor, N.m, from present positions in degrees."""
+        if not self.enabled:
+            return self._zeros
+        q = np.radians([present_pos_deg[slot] for slot in self._slots])
+        try:
+            tau = gravity_model.gravity_torque(
+                q, payload=self._payload, payload_com=self._payload_com
+            )
+        except Exception as e:
+            logger.warning(f"Gravity compensation failed, commanding zero: {e}")
+            return self._zeros
+        tau = np.clip(tau * self._scale, -self._limit, self._limit)
+        out = list(self._zeros)
+        for value, slot in zip(tau, self._slots, strict=True):
+            out[slot] = float(value)
+        return out
 
 
 def _follower_process_main(
@@ -192,6 +250,7 @@ def _follower_process_main(
     prev_tick: float | None = None
     use_mit = config.control_mode == "mit"
     interval = 1.0 / config.send_rate_hz
+    gravity = _GravityCompensator(config, motor_names)
 
     try:
         while not stop_event.is_set():
@@ -222,6 +281,9 @@ def _follower_process_main(
                 present_pos_shared[i] = math.degrees(state.pos) if state is not None else 0.0
                 present_torq_shared[i] = state.torq if state is not None else 0.0
                 present_vel_shared[i] = math.degrees(state.vel) if state is not None else 0.0
+            # From the angles just read, so the arm is carried at the pose it is
+            # actually in rather than the one it was asked for.
+            gravity_torques = gravity.torques(present_pos_shared)
             present_pos_ts.value = time.perf_counter()
 
             if goal_ready.value:
@@ -252,11 +314,12 @@ def _follower_process_main(
                     idx = i
                     pos_rad = math.radians(smoothed_pos[name])
                     vel_rad_s = math.radians(smoothed_vel[name])
+                    tau = tau_ff_shared[i] + gravity_torques[i]
                     try:
                         if name == GRIPPER_MOTOR:
                             if config.gripper_control_mode == "mit":
                                 motor.send_mit(
-                                    pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau_ff_shared[i]
+                                    pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau
                                 )
                             else:
                                 vel_deg_s = (
@@ -267,7 +330,7 @@ def _follower_process_main(
                                 motor.send_force_pos(pos_rad, math.radians(vel_deg_s), config.gripper_torque_ratio)
                         elif use_mit:
                             motor.send_mit(
-                                pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau_ff_shared[i]
+                                pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau
                             )
                         else:
                             vel_deg_s = (
@@ -363,6 +426,10 @@ class RebotB601Follower(Robot):
         self._stop_event = self._mp_ctx.Event()
         self._error_queue = self._mp_ctx.Queue()
         self._follower_process: multiprocessing.process.BaseProcess | None = None
+        # Parent-side mirror of the follower process's compensator, built on
+        # first use by gravity_torques(). Stateless given the config, so the two
+        # cannot disagree.
+        self._gravity: _GravityCompensator | None = None
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -654,6 +721,19 @@ class RebotB601Follower(Robot):
             self._write_per_motor(self._mit_kp_shared, kp)
         if kd is not None:
             self._write_per_motor(self._mit_kd_shared, kd)
+
+    def gravity_torques(self) -> dict[str, float]:
+        """The holding torque the follower process is adding right now, by motor.
+
+        Recomputed here from the same config and the latest reading, rather than
+        read back from the process, so a caller sees exactly what is being
+        applied without another shared array. All zeros when compensation is off.
+        """
+        if self._gravity is None:
+            self._gravity = _GravityCompensator(self.config, self.motor_names)
+        present = self._present_pos()
+        torques = self._gravity.torques([present[name] for name in self.motor_names])
+        return dict(zip(self.motor_names, torques, strict=True))
 
     def get_mit_gains(self) -> tuple[dict[str, float], dict[str, float]]:
         """The (kp, kd) the follower process is currently sending, by motor

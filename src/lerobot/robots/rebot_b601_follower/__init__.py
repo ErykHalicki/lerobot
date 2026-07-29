@@ -15,6 +15,13 @@
 # limitations under the License.
 
 from .config_rebot_b601_follower import RebotB601FollowerConfig, RebotB601FollowerRobotConfig
+from .gravity_model import JOINT_NAMES, gravity_torque
 from .rebot_b601_follower import RebotB601Follower
 
-__all__ = ["RebotB601Follower", "RebotB601FollowerConfig", "RebotB601FollowerRobotConfig"]
+__all__ = [
+    "JOINT_NAMES",
+    "RebotB601Follower",
+    "RebotB601FollowerConfig",
+    "RebotB601FollowerRobotConfig",
+    "gravity_torque",
+]

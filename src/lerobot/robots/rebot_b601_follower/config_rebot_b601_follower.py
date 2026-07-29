@@ -98,6 +98,29 @@ class RebotB601FollowerConfig:
     mit_kp: float | list[float] = field(default_factory=lambda: [45.0, 45.0, 45.0, 8.0, 9.0, 8.0, 8.0])
     mit_kd: float | list[float] = field(default_factory=lambda: [12.0, 12.0, 12.0, 1.0, 1.0, 1.0, 1.0])
 
+    # Add tau = g(q) to every MIT command, from the angles the follower process
+    # already reads each tick. Without it a joint sits g(q)/kp below target to
+    # make its holding torque: a standing teleoperation error, and a gap between
+    # a recorded action and the state it produced. MIT only. Assumes motor zeros
+    # at the URDF zero pose, where lerobot-calibrate homes.
+    gravity_compensation: bool = True
+
+    # Trim for what a rigid-body model cannot know: joint friction and cable
+    # drag. `gravity_gain` scales every joint, `gravity_scale` one of them, e.g.
+    # {"shoulder_lift": 1.1}. Both are per-rig, so neither is set by default.
+    gravity_gain: float = 1.0
+    gravity_scale: dict[str, float] = field(default_factory=dict)
+
+    # Mass (kg) carried at the end effector beyond the modelled gripper, and
+    # where it sits in the end effector's frame.
+    gravity_payload_kg: float = 0.0
+    gravity_payload_com: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    # Ceiling on the gravity term alone, N.m, applied on top of each motor's
+    # rated effort -- so it only binds on the three 27 N.m joints. shoulder_lift
+    # needs 15.5 N.m at full reach; a lower ceiling makes it sag, not safer.
+    gravity_max_torque: float = 20.0
+
     # Gripper control: "force_pos" or "mit".
     gripper_control_mode: str = "force_pos"
 
