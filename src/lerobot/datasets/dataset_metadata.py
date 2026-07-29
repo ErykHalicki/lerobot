@@ -437,6 +437,26 @@ class LeRobotDatasetMetadata:
         self.info = load_info(self.root)
 
     @property
+    def robot_config(self) -> dict | None:
+        """The robot/teleoperator settings the episodes were recorded under.
+
+        ``robot_type`` says which arm; this says how it was driven. Gains and
+        control mode decide the relationship between a recorded action and the
+        state it produced, so two datasets from the same arm are only
+        interchangeable if this matches. ``None`` for datasets recorded before
+        it was captured.
+        """
+        declared = self.info.robot_config
+        return deepcopy(declared) if declared else None
+
+    @robot_config.setter
+    def robot_config(self, value: dict | None) -> None:
+        """Persist recording settings to ``meta/info.json`` and reload metadata."""
+        self.info.robot_config = deepcopy(value) if value else None
+        write_info(self.info, self.root)
+        self.info = load_info(self.root)
+
+    @property
     def names(self) -> dict[str, list | dict]:
         """Names of the various dimensions of vector modalities."""
         return {key: ft["names"] for key, ft in self.features.items()}
