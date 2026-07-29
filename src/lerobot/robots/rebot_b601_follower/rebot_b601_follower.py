@@ -64,8 +64,8 @@ MOTOR_MODELS = {
 _ENSURE_MODE_RETRIES = 9
 _SETTLE_SEC = 0.01
 _ZERO_SETTLE_SEC = 0.1
-# Held at the end of _go_home(). The motor (and the smoother ahead of it) trails
-# the goal, and disconnect() stops the follower process the instant _go_home()
+# Held at the end of go_home(). The motor (and the smoother ahead of it) trails
+# the goal, and disconnect() stops the follower process the instant go_home()
 # returns, which would otherwise cut the gripper off part-closed.
 _GRIPPER_SETTLE_SEC = 0.5
 
@@ -965,9 +965,13 @@ class RebotB601Follower(Robot):
             self.send_action({f"{name}.pos": value for name, value in targets.items()})
             time.sleep(tick)
 
-    def _go_home(self) -> None:
+    def go_home(self) -> None:
         """Ramp every joint to 0° (the calibration zero pose) over
         `home_duration_s`, except the gripper and the wrist.
+
+        Public capability: callers that home between episodes (recording, eval)
+        detect it by this method's presence, and it must remain the same ramp
+        disconnect() uses so the two can't drift.
 
         The gripper opens all the way during that ramp, so it can't be gripping
         anything while the arm moves. The wrist holds `home_wrist_flex_deg`
@@ -1001,7 +1005,7 @@ class RebotB601Follower(Robot):
     @check_if_not_connected
     def disconnect(self) -> None:
         if self.config.return_home_on_disconnect:
-            self._go_home()
+            self.go_home()
 
         # Stop the follower process first: it owns the other hardware connection.
         self._stop_follower_process()
