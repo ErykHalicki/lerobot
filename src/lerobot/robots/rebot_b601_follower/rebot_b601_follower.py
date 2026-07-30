@@ -159,6 +159,71 @@ class _GravityCompensator:
         return out
 
 
+class _HomeRamp:
+    """The path back to the calibration zero pose, as a function of how long
+    the ramp has been running.
+
+    Sampled by elapsed time rather than stepped, so the arm arrives on schedule
+    whatever the driving loop does: a late tick resumes where the clock says,
+    instead of stretching the ramp out. Eased, so a joint that starts far from
+    zero doesn't travel any faster than one that starts close.
+
+    Three legs, held in one object so whoever drives it keeps no state:
+
+    1. every joint eases to 0 over `home_duration_s`, except the gripper, which
+       opens all the way (so it can't be gripping anything while the arm moves)
+       and the wrist, which holds `home_wrist_flex_deg` to keep whatever is on
+       the end clear of the shoulder -- coming in flat swings it into the
+       shoulder at full ramp speed.
+    2. the gripper closes to 0 while the wrist lowers to 0 over
+       `gripper_close_duration_s`, so the load is set down over the whole close
+       rather than dropped at the end of it.
+    3. the settled pose is held for _GRIPPER_SETTLE_SEC, since both are still
+       travelling when their goals stop moving.
+    """
+
+    def __init__(
+        self,
+        config: RebotB601FollowerRobotConfig,
+        motor_names: list[str],
+        start: dict[str, float],
+    ):
+        self._limits = config.joint_limits
+        gripper_open = config.joint_limits[GRIPPER_MOTOR][0]
+        wrist_up = config.home_wrist_flex_deg
+
+        self._approach = {name: (start[name], 0.0) for name in motor_names}
+        self._approach[GRIPPER_MOTOR] = (start[GRIPPER_MOTOR], gripper_open)
+        self._approach[WRIST_MOTOR] = (start[WRIST_MOTOR], wrist_up)
+        # Every joint stays in the close leg, holding the zero it reached, so
+        # each sample is a complete goal rather than a partial one.
+        self._close = dict.fromkeys(motor_names, (0.0, 0.0))
+        self._close[GRIPPER_MOTOR] = (gripper_open, 0.0)
+        self._close[WRIST_MOTOR] = (wrist_up, 0.0)
+
+        self._approach_s = config.home_duration_s
+        self._close_s = config.gripper_close_duration_s
+        self.duration = self._approach_s + self._close_s + _GRIPPER_SETTLE_SEC
+
+    def target(self, elapsed: float) -> dict[str, float]:
+        """The goal position (degrees) for every joint `elapsed` seconds in."""
+        if elapsed < self._approach_s:
+            leg, span, t = self._approach, self._approach_s, elapsed
+        else:
+            leg, span, t = self._close, self._close_s, elapsed - self._approach_s
+        frac = min(1.0, t / span) if span > 0 else 1.0
+        eased = frac * frac * (3.0 - 2.0 * frac)  # smoothstep: zero velocity at both ends
+        return {name: self._clip(name, s + eased * (e - s)) for name, (s, e) in leg.items()}
+
+    def _clip(self, name: str, value: float) -> float:
+        """Same soft joint limits send_action() applies, since the ramp reaches
+        the shared goal without passing through it."""
+        if name not in self._limits:
+            return value
+        low, high = self._limits[name]
+        return max(low, min(high, value))
+
+
 def _follower_process_main(
     config: RebotB601FollowerRobotConfig,
     motor_names: list[str],
@@ -177,6 +242,7 @@ def _follower_process_main(
     ready_event,
     stop_event,
     error_queue: multiprocessing.Queue,
+    home_done,
 ) -> None:
     """Sole owner of the motor connection: runs the read/smooth/send loop at
     config.send_rate_hz in its own process, so nothing in the caller's
@@ -186,7 +252,8 @@ def _follower_process_main(
     `mit_kp_shared`/`mit_kd_shared`/`tau_ff_shared` (how hard to chase it),
     `present_pos_shared`/`present_torq_shared`/`present_vel_shared`/
     `present_pos_ts` (latest reading), `last_sent_shared` (what was actually
-    sent). `command_queue` carries disable/enable/clear_error.
+    sent). `command_queue` carries disable/enable/clear_error/home, and
+    `home_done` reports the end of a home ramp back to go_home().
     """
     # Ignore SIGINT: a raw Ctrl-C could interrupt a send_mit() call
     # mid-transaction and leave a motor comm-faulted. Shutdown goes through
@@ -248,6 +315,9 @@ def _follower_process_main(
     smoothers: dict[str, _SCurveAxis] = {}
     last_send_time: float | None = None
     prev_tick: float | None = None
+    home_ramp: _HomeRamp | None = None
+    home_started: float = 0.0
+    home_requested = False
     use_mit = config.control_mode == "mit"
     interval = 1.0 / config.send_rate_hz
     gravity = _GravityCompensator(config, motor_names)
@@ -269,6 +339,10 @@ def _follower_process_main(
                 elif cmd == "clear_error":
                     for motor in motors.values():
                         motor.clear_error()
+                elif cmd == "home":
+                    # Built below instead of here, so the ramp starts from the
+                    # reading this tick is about to take rather than the last one.
+                    home_requested = True
 
             for motor in motors.values():
                 motor.request_feedback()
@@ -285,6 +359,28 @@ def _follower_process_main(
             # actually in rather than the one it was asked for.
             gravity_torques = gravity.torques(present_pos_shared)
             present_pos_ts.value = time.perf_counter()
+
+            if home_requested:
+                home_ramp = _HomeRamp(
+                    config,
+                    motor_names,
+                    {name: present_pos_shared[i] for i, name in enumerate(motor_names)},
+                )
+                home_started = time.perf_counter()
+                home_requested = False
+
+            # Driven here rather than in go_home() so nothing holding the
+            # caller's GIL can freeze the goal mid-travel. Overwrites whatever
+            # send_action() last wrote, so a stale teleop loop can't fight it.
+            if home_ramp is not None:
+                elapsed = time.perf_counter() - home_started
+                target = home_ramp.target(elapsed)
+                for i, name in enumerate(motor_names):
+                    goal_pos_shared[i] = target[name]
+                goal_ready.value = 1
+                if elapsed >= home_ramp.duration:
+                    home_ramp = None
+                    home_done.set()
 
             if goal_ready.value:
                 goal_pos = {name: goal_pos_shared[i] for i, name in enumerate(motor_names)}
@@ -351,6 +447,9 @@ def _follower_process_main(
             elapsed = time.perf_counter() - t0
             stop_event.wait(max(0.0, interval - elapsed))
     finally:
+        # A go_home() still waiting has nothing left to wait for; let it return
+        # and find the arm wherever the ramp got to, rather than time out.
+        home_done.set()
         for motor in motors.values():
             if config.disable_torque_on_disconnect:
                 motor.disable()
@@ -425,6 +524,9 @@ class RebotB601Follower(Robot):
         self._ready_event = self._mp_ctx.Event()
         self._stop_event = self._mp_ctx.Event()
         self._error_queue = self._mp_ctx.Queue()
+        # Set by the follower process when a home ramp finishes; go_home()'s
+        # only way of knowing, since it no longer drives the ramp itself.
+        self._home_done = self._mp_ctx.Event()
         self._follower_process: multiprocessing.process.BaseProcess | None = None
         # Parent-side mirror of the follower process's compensator, built on
         # first use by gravity_torques(). Stateless given the config, so the two
@@ -904,6 +1006,7 @@ class RebotB601Follower(Robot):
                 self._ready_event,
                 self._stop_event,
                 self._error_queue,
+                self._home_done,
             ),
             name=f"{self}_follower_process",
             daemon=True,
@@ -930,6 +1033,11 @@ class RebotB601Follower(Robot):
                 self._follower_process.terminate()
                 self._follower_process.join(timeout=2.0)
         self._follower_process = None
+        # The only reader is gone, so any command still in flight will never be
+        # read. Left alone, the queue's feeder thread keeps it and the join that
+        # thread gets at interpreter exit never returns -- a hang after the work
+        # is done. Unsent commands are moot once the process is stopped.
+        self._command_queue.cancel_join_thread()
 
     def pin_follower_process_to_cores(self, cores: set[int]) -> None:
         """Best-effort: pin the follower process to the given CPU cores.
@@ -941,71 +1049,51 @@ class RebotB601Follower(Robot):
         except (AttributeError, OSError) as e:
             logger.warning(f"{self}: could not set follower process CPU affinity to {cores}: {e}")
 
-    def _ramp(self, targets: dict[str, tuple[float, float]], duration: float) -> None:
-        """Ramp each motor in `targets` (name -> (start, end)) from start to end
-        over `duration` seconds, independent of distance: each tick's target is
-        an eased interpolation, not the endpoint itself, so a motor that starts
-        far from its target doesn't move any faster than one that starts close."""
-        tick = 1.0 / self.config.send_rate_hz
-        t0 = time.monotonic()
-        while True:
-            frac = min(1.0, (time.monotonic() - t0) / duration)
-            eased = frac * frac * (3.0 - 2.0 * frac)  # smoothstep: zero velocity at both ends
-            self.send_action({f"{name}.pos": start + eased * (end - start) for name, (start, end) in targets.items()})
-            if frac >= 1.0:
-                return
-            time.sleep(tick)
-
-    def _hold(self, targets: dict[str, float], duration: float) -> None:
-        """Keep commanding a fixed target for `duration` seconds, giving the
-        motors time to actually arrive at a goal the ramp already reached."""
-        tick = 1.0 / self.config.send_rate_hz
-        deadline = time.monotonic() + duration
-        while time.monotonic() < deadline:
-            self.send_action({f"{name}.pos": value for name, value in targets.items()})
-            time.sleep(tick)
-
     def go_home(self) -> None:
-        """Ramp every joint to 0° (the calibration zero pose) over
-        `home_duration_s`, except the gripper and the wrist.
+        """Walk the arm back to its calibration zero pose (see _HomeRamp for
+        the path it takes) and return once it has settled there.
 
         Public capability: callers that home between episodes (recording, eval)
         detect it by this method's presence, and it must remain the same ramp
         disconnect() uses so the two can't drift.
 
-        The gripper opens all the way during that ramp, so it can't be gripping
-        anything while the arm moves. The wrist holds `home_wrist_flex_deg`
-        instead of 0° for the same span, pointing the gripper up and out of the
-        shoulder's way -- coming in flat swings whatever is on the end into the
-        shoulder at full ramp speed.
-
-        Both then finish together over `gripper_close_duration_s`: the gripper
-        closes to 0° while the wrist lowers to 0°, so the load is set down over
-        the whole close rather than dropped at the end of it.
-
-        A short hold follows, since both are still travelling when their goals
-        stop moving and the caller (disconnect()) shuts the follower process
-        down as soon as this returns.
+        The ramp runs in the follower process, for the same reason the send
+        loop does. Driven from here it is a 100 Hz python loop, so anything
+        that holds this process's GIL for a moment -- the dataset writer
+        flushing a video file between episodes, say -- freezes the goal
+        mid-travel and then jumps it, and the arm follows that as a jerk. This
+        side only waits.
         """
-        start = self._present_pos()
-        gripper_open = self.config.joint_limits[GRIPPER_MOTOR][0]
-        wrist_up = self.config.home_wrist_flex_deg
+        # Checked before the put, not just in the wait loop below, so a call
+        # with no process to serve it fails saying so rather than queueing a
+        # command nothing will read and waiting out the loop.
+        if self._follower_process is None or not self._follower_process.is_alive():
+            raise ConnectionError(f"{self}: follower process is not running; cannot home.")
 
-        targets = {name: (start[name], 0.0) for name in self.motor_names if name != GRIPPER_MOTOR}
-        targets[GRIPPER_MOTOR] = (start[GRIPPER_MOTOR], gripper_open)
-        targets[WRIST_MOTOR] = (start[WRIST_MOTOR], wrist_up)
-        self._ramp(targets, self.config.home_duration_s)
+        self._home_done.clear()
+        self._command_queue.put("home")
 
-        self._ramp(
-            {GRIPPER_MOTOR: (gripper_open, 0.0), WRIST_MOTOR: (wrist_up, 0.0)},
-            self.config.gripper_close_duration_s,
+        # The ramp keeps its own schedule, so overrunning this means the
+        # follower process is gone or wedged, not that homing is taking longer.
+        deadline = time.monotonic() + (
+            self.config.home_duration_s + self.config.gripper_close_duration_s + _GRIPPER_SETTLE_SEC + 5.0
         )
-        self._hold({GRIPPER_MOTOR: 0.0, WRIST_MOTOR: 0.0}, _GRIPPER_SETTLE_SEC)
+        while not self._home_done.wait(0.05):
+            if self._follower_process is None or not self._follower_process.is_alive():
+                raise ConnectionError(f"{self}: follower process stopped while homing.")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{self}: homing did not finish; the arm is part-way home.")
 
     @check_if_not_connected
     def disconnect(self) -> None:
         if self.config.return_home_on_disconnect:
-            self.go_home()
+            try:
+                self.go_home()
+            except (ConnectionError, TimeoutError) as e:
+                # Leaving the arm part-way home is bad; leaving it powered and
+                # holding position on a session that is over is worse, and the
+                # rest of this method is what drops torque.
+                logger.warning(f"{self}: homing failed on disconnect: {e}")
 
         # Stop the follower process first: it owns the other hardware connection.
         self._stop_follower_process()
