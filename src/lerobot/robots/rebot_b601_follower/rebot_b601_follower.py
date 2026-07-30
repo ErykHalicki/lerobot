@@ -18,7 +18,6 @@ import contextlib
 import logging
 import math
 import multiprocessing
-import os
 import queue
 import signal
 import time
@@ -1038,16 +1037,6 @@ class RebotB601Follower(Robot):
         # thread gets at interpreter exit never returns -- a hang after the work
         # is done. Unsent commands are moot once the process is stopped.
         self._command_queue.cancel_join_thread()
-
-    def pin_follower_process_to_cores(self, cores: set[int]) -> None:
-        """Best-effort: pin the follower process to the given CPU cores.
-        No-op if it isn't running or CPU affinity isn't supported."""
-        if self._follower_process is None or self._follower_process.pid is None:
-            return
-        try:
-            os.sched_setaffinity(self._follower_process.pid, cores)
-        except (AttributeError, OSError) as e:
-            logger.warning(f"{self}: could not set follower process CPU affinity to {cores}: {e}")
 
     def go_home(self) -> None:
         """Walk the arm back to its calibration zero pose (see _HomeRamp for
