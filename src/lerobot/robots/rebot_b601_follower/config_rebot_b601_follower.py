@@ -52,12 +52,12 @@ class RebotB601FollowerConfig:
     # of starting distance. The gripper opens fully during this ramp instead
     # of moving to 0° with the other joints, so it can't be gripping anything
     # while the arm moves.
-    home_duration_s: float = 5.0
+    home_duration_s: float = 1.67
 
     # Time to spend closing the gripper to 0° after home_duration_s, once
     # every other joint (and the gripper itself, fully open) has arrived. The
     # wrist lowers from home_wrist_flex_deg to 0° over this same span.
-    gripper_close_duration_s: float = 2.0
+    gripper_close_duration_s: float = 0.67
 
     # Where to hold wrist_flex while the arm ramps home, in degrees; negative
     # points the gripper up. Keeps whatever is on the end clear of the shoulder
@@ -124,9 +124,9 @@ class RebotB601FollowerConfig:
     # Thermal protection, on the MOSFET and rotor temperatures every CAN
     # feedback frame already carries. Level 1 and 2 warn on the terminal;
     # level 3 homes the arm and disconnects it.
-    temp_warn_c: float = 45.0
-    temp_danger_c: float = 50.0
-    temp_max_c: float = 55.0
+    temp_warn_c: float = 57.0
+    temp_danger_c: float = 61.0
+    temp_max_c: float = 65.0
 
     # How often a motor sitting at level 1 / level 2 warns again, in seconds.
     # Crossing into a higher level always warns immediately.

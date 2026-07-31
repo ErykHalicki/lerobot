@@ -27,6 +27,11 @@ MOTORS = ["shoulder_pan", "wrist_flex", "gripper"]
 
 def _config(**overrides) -> RebotB601FollowerRobotConfig:
     config = RebotB601FollowerRobotConfig(port="/dev/null")
+    # Pinned rather than taken from the defaults, which are a per-rig safety
+    # policy and free to move; every temperature below is written against these.
+    config.temp_warn_c = 45.0
+    config.temp_danger_c = 50.0
+    config.temp_max_c = 55.0
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
