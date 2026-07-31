@@ -121,6 +121,33 @@ class RebotB601FollowerConfig:
     # needs 15.5 N.m at full reach; a lower ceiling makes it sag, not safer.
     gravity_max_torque: float = 20.0
 
+    # Thermal protection, on the MOSFET and rotor temperatures every CAN
+    # feedback frame already carries. Level 1 and 2 warn on the terminal;
+    # level 3 homes the arm and disconnects it.
+    temp_warn_c: float = 45.0
+    temp_danger_c: float = 50.0
+    temp_max_c: float = 55.0
+
+    # How often a motor sitting at level 1 / level 2 warns again, in seconds.
+    # Crossing into a higher level always warns immediately.
+    temp_warn_repeat_s: float = 3.0
+    temp_danger_repeat_s: float = 1.0
+
+    # Temperature history behind the quadratic fit that estimates time to
+    # shutdown: how long a window to keep, and how often to sample it.
+    temp_history_s: float = 60.0
+    temp_sample_hz: float = 10.0
+
+    # Home and disconnect on reaching temp_max_c. Turning this off leaves the
+    # warnings in place but never shuts the arm down on its own.
+    temp_shutdown_enabled: bool = True
+
+    # Publish the per-motor time-to-overheat estimate for
+    # motor_overheat_etas(). Off by default: refitting every motor costs about
+    # an eighth of a core at loop rate, and nothing needs it unless something
+    # is watching.
+    temp_debug: bool = False
+
     # Gripper control: "force_pos" or "mit".
     gripper_control_mode: str = "force_pos"
 

@@ -37,12 +37,14 @@ from lerobot.robots.rebot_b601_follower.rebot_b601_follower import (
 _MODULE = "lerobot.robots.rebot_b601_follower.rebot_b601_follower"
 
 
-def _make_motor_mock(position_rad: float = 0.0) -> MagicMock:
+def _make_motor_mock(position_rad: float = 0.0, temp_c: float = 25.0) -> MagicMock:
     motor = MagicMock(name="MotorMock")
     state = MagicMock()
     state.pos = position_rad
     state.vel = 0.0
     state.torq = 0.0
+    state.t_mos = temp_c
+    state.t_rotor = temp_c
     motor.get_state.return_value = state
     return motor
 
@@ -146,6 +148,9 @@ def _run_one_tick(config, goal_deg: dict[str, float]) -> dict[str, MagicMock]:
                 robot._present_pos_shared,
                 robot._present_torq_shared,
                 robot._present_vel_shared,
+                robot._present_temp_mos_shared,
+                robot._present_temp_rotor_shared,
+                robot._present_temp_eta_shared,
                 robot._present_pos_ts,
                 robot._last_sent_shared,
                 robot._has_sent_ever,
@@ -157,6 +162,8 @@ def _run_one_tick(config, goal_deg: dict[str, float]) -> dict[str, MagicMock]:
                 robot._stop_event,
                 robot._error_queue,
                 robot._home_done,
+                robot._homing_flag,
+                robot._thermal_shutdown,
             ),
             daemon=True,
         )
@@ -361,6 +368,340 @@ def test_go_home_without_a_follower_process_queues_nothing():
     # Not just that it raises: a command no live process will read would be
     # stranded with the queue's feeder thread and hang the interpreter at exit.
     robot._command_queue.put.assert_not_called()
+
+
+def test_send_action_is_ignored_while_homing(follower):
+    # Inside every joint's soft limits, so nothing here is clipped on the way in.
+    _seed_present(follower, pos_deg=1.0)
+    follower.send_action({f"{m}.pos": -10.0 for m in follower.motor_names})
+    for i in range(len(follower.motor_names)):
+        follower._last_sent_shared[i] = 3.0
+
+    follower._homing_flag.value = 1
+    returned = follower.send_action({f"{m}.pos": -20.0 for m in follower.motor_names})
+
+    # The goal the ramp is working from must survive a teleop loop that keeps
+    # calling all the way through the ramp.
+    assert all(value == pytest.approx(-10.0) for value in follower._goal_pos_shared)
+    assert all(value == pytest.approx(3.0) for value in returned.values())
+
+
+def test_send_action_resumes_once_homing_clears(follower):
+    follower._homing_flag.value = 1
+    follower.send_action({f"{m}.pos": -20.0 for m in follower.motor_names})
+    follower._homing_flag.value = 0
+    follower.send_action({f"{m}.pos": -30.0 for m in follower.motor_names})
+    assert all(value == pytest.approx(-30.0) for value in follower._goal_pos_shared)
+
+
+def test_home_ramp_does_not_read_the_shared_goal(follower):
+    """The ramp publishes its target so the arm holds the homed pose afterwards,
+    but must dispatch from its own copy, or a send_action() landing between the
+    write and the read steers the arm mid-ramp."""
+    config = RebotB601FollowerRobotConfig(port="/dev/null", home_duration_s=0.2)
+    ramp = _HomeRamp(config, list(config.motor_can_ids), dict.fromkeys(config.motor_can_ids, 30.0))
+    first = ramp.target(0.0)
+    assert first[WRIST_MOTOR] == pytest.approx(30.0)
+    assert ramp.target(ramp.duration)[GRIPPER_MOTOR] == pytest.approx(0.0)
+
+
+def test_follower_process_publishes_motor_temperatures():
+    config = RebotB601FollowerRobotConfig(port="/dev/null")
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        robot = RebotB601Follower(config)
+    _run_one_tick(config, dict.fromkeys(robot.motor_names, 0.0))
+
+
+def test_motor_temperatures_reports_both_components(follower):
+    follower._present_pos_ts.value = 1.0
+    for i in range(len(follower.motor_names)):
+        follower._present_temp_mos_shared[i] = 40.0 + i
+        follower._present_temp_rotor_shared[i] = 30.0 + i
+
+    temps = follower.motor_temperatures()
+
+    assert set(temps) == set(follower.motor_names)
+    for i, motor in enumerate(follower.motor_names):
+        assert temps[motor]["mosfet"] == pytest.approx(40.0 + i)
+        assert temps[motor]["rotor"] == pytest.approx(30.0 + i)
+
+
+def test_motor_temperatures_falls_back_to_zero_before_first_tick(follower):
+    temps = follower.motor_temperatures()
+    assert all(reading == {"mosfet": 0.0, "rotor": 0.0} for reading in temps.values())
+
+
+def test_thermal_shutdown_event_disconnects_the_arm(follower):
+    """The follower process only raises the event; bringing the arm down is the
+    parent's job, and it has to happen without the caller ticking."""
+    assert follower.is_connected
+    follower._thermal_shutdown.set()
+
+    deadline = time.monotonic() + 5.0
+    while follower.is_connected and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert not follower.is_connected
+
+
+def _run_home_ramp_with_gains(kp: float, kd: float) -> dict[str, list]:
+    """Soften every joint to (kp, kd), run a home ramp to completion, and return
+    the send_mit call args each motor saw during it."""
+    config = RebotB601FollowerRobotConfig(
+        port="/dev/null",
+        control_mode="mit",
+        home_duration_s=0.2,
+        gripper_close_duration_s=0.1,
+        enable_trajectory_smoothing=False,
+    )
+    robot = RebotB601Follower(config)
+    motor_names = robot.motor_names
+    # What a floating caller (gravity compensation) leaves in shared memory.
+    for i in range(len(motor_names)):
+        robot._mit_kp_shared[i] = kp
+        robot._mit_kd_shared[i] = kd
+        robot._present_pos_shared[i] = 30.0
+
+    captured: dict[str, MagicMock] = {}
+
+    def _add_motor(send_id, _recv_id, _model):
+        motor = _make_motor_mock(position_rad=math.radians(30.0))
+        for name, (s, _r) in config.motor_can_ids.items():
+            if s == send_id:
+                captured[name] = motor
+        return motor
+
+    bus_for_loop = MagicMock()
+    bus_for_loop.add_damiao_motor.side_effect = _add_motor
+
+    with (
+        patch(f"{_MODULE}.MotorBridgeController") as controller_cls,
+        patch(f"{_MODULE}.signal", MagicMock()),
+    ):
+        controller_cls.from_dm_serial.return_value = bus_for_loop
+        controller_cls.return_value = bus_for_loop
+        thread = threading.Thread(
+            target=_follower_process_main,
+            args=(
+                config,
+                motor_names,
+                robot._goal_pos_shared,
+                robot._goal_ready,
+                robot._present_pos_shared,
+                robot._present_torq_shared,
+                robot._present_vel_shared,
+                robot._present_temp_mos_shared,
+                robot._present_temp_rotor_shared,
+                robot._present_temp_eta_shared,
+                robot._present_pos_ts,
+                robot._last_sent_shared,
+                robot._has_sent_ever,
+                robot._mit_kp_shared,
+                robot._mit_kd_shared,
+                robot._tau_ff_shared,
+                robot._command_queue,
+                robot._ready_event,
+                robot._stop_event,
+                robot._error_queue,
+                robot._home_done,
+                robot._homing_flag,
+                robot._thermal_shutdown,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            assert robot._ready_event.wait(5.0)
+            robot._home_done.clear()
+            robot._homing_flag.value = 1
+            robot._command_queue.put("home")
+            assert robot._home_done.wait(5.0), "home ramp never finished"
+        finally:
+            robot._stop_event.set()
+            thread.join(timeout=5.0)
+
+    return {name: [call.args for call in motor.send_mit.call_args_list] for name, motor in captured.items()}
+
+
+def test_home_ramp_drives_on_configured_gains_not_a_softened_callers():
+    """A floated arm (kp=0, as under gravity compensation) has no position
+    spring, so homing on the caller's gains moves nothing and the arm drops
+    when torque goes. The ramp has to restore the gains that can carry it."""
+    calls = _run_home_ramp_with_gains(kp=0.0, kd=0.8)
+
+    arm_joints = [n for n in calls if n != GRIPPER_MOTOR]
+    assert arm_joints, "expected arm joints driven in MIT mode"
+    for name in arm_joints:
+        assert calls[name], f"{name} was never commanded during the ramp"
+        kps = {args[2] for args in calls[name]}
+        assert 0.0 not in kps, f"{name} homed at kp=0 and would have ignored the ramp"
+
+
+def test_home_ramp_uses_each_joints_own_configured_gain():
+    calls = _run_home_ramp_with_gains(kp=0.0, kd=0.8)
+    config = RebotB601FollowerRobotConfig(port="/dev/null")
+    configured_kp = config.mit_kp
+    assert isinstance(configured_kp, list), "this test assumes per-joint gains"
+    expected_kp = dict(zip(list(config.motor_can_ids), configured_kp, strict=True))
+
+    for name, sent in calls.items():
+        if name == GRIPPER_MOTOR or not sent:
+            continue
+        for args in sent:
+            assert args[2] == pytest.approx(expected_kp[name])
+
+
+def test_softened_gains_are_restored_after_the_ramp_not_stomped():
+    """The ramp overrides the gains while it runs; it must not rewrite what the
+    caller put in shared memory, or a mid-session go_home() would silently end
+    a float."""
+    config = RebotB601FollowerRobotConfig(port="/dev/null")
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        robot = RebotB601Follower(config)
+    for i in range(len(robot.motor_names)):
+        robot._mit_kp_shared[i] = 0.0
+
+    _run_home_ramp_with_gains(kp=0.0, kd=0.8)
+
+    kp_after, _ = robot.get_mit_gains()
+    assert all(value == 0.0 for value in kp_after.values())
+
+
+class _HeatingState:
+    """A motor state whose temperatures climb in real time, so the follower
+    process's own fit has a trend to find."""
+
+    pos = 0.0
+    vel = 0.0
+    torq = 0.0
+
+    def __init__(self, start_c: float, rate_c_per_s: float):
+        self._start = start_c
+        self._rate = rate_c_per_s
+        self._t0 = time.perf_counter()
+
+    @property
+    def t_mos(self) -> float:
+        return self._start + self._rate * (time.perf_counter() - self._t0)
+
+    @property
+    def t_rotor(self) -> float:
+        return self.t_mos
+
+
+def _run_follower_until(config, predicate, timeout_s: float = 10.0) -> bool:
+    """Run the follower loop in a thread against heating motors until
+    `predicate(robot)` holds. Returns whether it did before the timeout."""
+    robot = RebotB601Follower(config)
+    for i in range(len(robot.motor_names)):
+        robot._goal_pos_shared[i] = 0.0
+    robot._goal_ready.value = 1
+
+    bus_for_loop = MagicMock()
+
+    def _add_motor(_send_id, _recv_id, _model):
+        motor = MagicMock()
+        motor.get_state.return_value = _HeatingState(start_c=30.0, rate_c_per_s=10.0)
+        return motor
+
+    bus_for_loop.add_damiao_motor.side_effect = _add_motor
+
+    with (
+        patch(f"{_MODULE}.MotorBridgeController") as controller_cls,
+        patch(f"{_MODULE}.signal", MagicMock()),
+    ):
+        controller_cls.from_dm_serial.return_value = bus_for_loop
+        controller_cls.return_value = bus_for_loop
+        thread = threading.Thread(
+            target=_follower_process_main,
+            args=(
+                config,
+                robot.motor_names,
+                robot._goal_pos_shared,
+                robot._goal_ready,
+                robot._present_pos_shared,
+                robot._present_torq_shared,
+                robot._present_vel_shared,
+                robot._present_temp_mos_shared,
+                robot._present_temp_rotor_shared,
+                robot._present_temp_eta_shared,
+                robot._present_pos_ts,
+                robot._last_sent_shared,
+                robot._has_sent_ever,
+                robot._mit_kp_shared,
+                robot._mit_kd_shared,
+                robot._tau_ff_shared,
+                robot._command_queue,
+                robot._ready_event,
+                robot._stop_event,
+                robot._error_queue,
+                robot._home_done,
+                robot._homing_flag,
+                robot._thermal_shutdown,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                if predicate(robot):
+                    return True
+                time.sleep(0.02)
+            return False
+        finally:
+            robot._stop_event.set()
+            thread.join(timeout=5.0)
+
+
+def _debug_temp_config(**overrides) -> RebotB601FollowerRobotConfig:
+    """Thresholds far above anything the heating mock reaches inside a test, so
+    the fit is exercised without warnings printing to the terminal."""
+    return RebotB601FollowerRobotConfig(
+        port="/dev/null",
+        temp_warn_c=150.0,
+        temp_danger_c=180.0,
+        temp_max_c=200.0,
+        temp_history_s=2.0,
+        temp_sample_hz=50.0,
+        **overrides,
+    )
+
+
+def test_debug_temp_publishes_a_time_to_overheat_estimate():
+    """Climbing 10C/s from 30C, a motor is ~17s from the 200C threshold, and
+    that estimate has to reach the parent through shared memory."""
+    captured: dict[str, float] = {}
+
+    def _every_motor_has_an_estimate(robot) -> bool:
+        etas = robot.motor_overheat_etas()
+        if all(eta is not None for eta in etas.values()):
+            captured.update(etas)
+            return True
+        return False
+
+    assert _run_follower_until(_debug_temp_config(temp_debug=True), _every_motor_has_an_estimate), (
+        "no estimate was ever published"
+    )
+    for name, eta in captured.items():
+        assert 10.0 < eta < 20.0, f"{name} estimated {eta:.1f}s, expected ~17s"
+
+
+def test_debug_temp_off_publishes_nothing():
+    config = _debug_temp_config(temp_debug=False)
+    # Long enough to have produced estimates had the flag been on.
+    published = _run_follower_until(
+        config, lambda r: any(v is not None for v in r.motor_overheat_etas().values()), timeout_s=2.0
+    )
+    assert not published
+
+
+def test_thermal_watch_is_not_started_when_shutdown_is_disabled():
+    config = RebotB601FollowerRobotConfig(port="/dev/null", temp_shutdown_enabled=False)
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        robot = RebotB601Follower(config)
+    robot._start_thermal_watch()
+    assert robot._thermal_thread is None
 
 
 def test_disconnect_releases_the_command_queue(follower):

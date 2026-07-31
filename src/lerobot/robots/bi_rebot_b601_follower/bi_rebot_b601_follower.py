@@ -73,6 +73,15 @@ class BiRebotB601Follower(BimanualMixin, Robot):
             gripper_mit_kp=config.left_arm_config.gripper_mit_kp,
             gripper_mit_kd=config.left_arm_config.gripper_mit_kd,
             joint_limits=config.left_arm_config.joint_limits,
+            temp_warn_c=config.left_arm_config.temp_warn_c,
+            temp_danger_c=config.left_arm_config.temp_danger_c,
+            temp_max_c=config.left_arm_config.temp_max_c,
+            temp_warn_repeat_s=config.left_arm_config.temp_warn_repeat_s,
+            temp_danger_repeat_s=config.left_arm_config.temp_danger_repeat_s,
+            temp_history_s=config.left_arm_config.temp_history_s,
+            temp_sample_hz=config.left_arm_config.temp_sample_hz,
+            temp_shutdown_enabled=config.left_arm_config.temp_shutdown_enabled,
+            temp_debug=config.left_arm_config.temp_debug,
         )
 
         right_arm_config = RebotB601FollowerRobotConfig(
@@ -94,6 +103,15 @@ class BiRebotB601Follower(BimanualMixin, Robot):
             gripper_mit_kp=config.right_arm_config.gripper_mit_kp,
             gripper_mit_kd=config.right_arm_config.gripper_mit_kd,
             joint_limits=config.right_arm_config.joint_limits,
+            temp_warn_c=config.right_arm_config.temp_warn_c,
+            temp_danger_c=config.right_arm_config.temp_danger_c,
+            temp_max_c=config.right_arm_config.temp_max_c,
+            temp_warn_repeat_s=config.right_arm_config.temp_warn_repeat_s,
+            temp_danger_repeat_s=config.right_arm_config.temp_danger_repeat_s,
+            temp_history_s=config.right_arm_config.temp_history_s,
+            temp_sample_hz=config.right_arm_config.temp_sample_hz,
+            temp_shutdown_enabled=config.right_arm_config.temp_shutdown_enabled,
+            temp_debug=config.right_arm_config.temp_debug,
         )
 
         self.left_arm = RebotB601Follower(left_arm_config)

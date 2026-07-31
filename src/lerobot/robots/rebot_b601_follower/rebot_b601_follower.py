@@ -20,6 +20,7 @@ import math
 import multiprocessing
 import queue
 import signal
+import threading
 import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
@@ -36,6 +37,7 @@ from ..robot import Robot
 from ..utils import ensure_safe_goal_position
 from . import gravity_model
 from .config_rebot_b601_follower import RebotB601FollowerRobotConfig
+from .thermal_monitor import COMPONENTS, ThermalMonitor
 
 if TYPE_CHECKING or _motorbridge_available:
     from motorbridge import Controller as MotorBridgeController, Mode as MotorBridgeMode
@@ -60,6 +62,9 @@ MOTOR_MODELS = {
     "wrist_roll": "4310",
     "gripper": "4310",
 }
+# Shared-array stand-in for "no time-to-overheat estimate", since a shared
+# array of doubles has no room for None. Any real estimate is positive.
+_NO_ETA = -1.0
 _ENSURE_MODE_RETRIES = 9
 _SETTLE_SEC = 0.01
 _ZERO_SETTLE_SEC = 0.1
@@ -223,6 +228,33 @@ class _HomeRamp:
         return max(low, min(high, value))
 
 
+def _configured_gains(
+    config: RebotB601FollowerRobotConfig, motor_names: list[str]
+) -> tuple[list[float], list[float]]:
+    """The MIT gains from the config, one per motor and the gripper's own pair
+    included, in motor order.
+
+    The home ramp drives with these rather than whatever is in shared memory,
+    so a caller that softened the arm cannot leave it unable to answer its own
+    goal. Resolved once, since the send loop reads them every tick.
+    """
+
+    def per_motor(value, gripper_value) -> list[float]:
+        resolved = [
+            float(value[i]) if isinstance(value, (list, tuple)) else float(value)
+            for i in range(len(motor_names))
+        ]
+        for i, name in enumerate(motor_names):
+            if name == GRIPPER_MOTOR:
+                resolved[i] = float(gripper_value)
+        return resolved
+
+    return (
+        per_motor(config.mit_kp, config.gripper_mit_kp),
+        per_motor(config.mit_kd, config.gripper_mit_kd),
+    )
+
+
 def _follower_process_main(
     config: RebotB601FollowerRobotConfig,
     motor_names: list[str],
@@ -231,6 +263,9 @@ def _follower_process_main(
     present_pos_shared,
     present_torq_shared,
     present_vel_shared,
+    present_temp_mos_shared,
+    present_temp_rotor_shared,
+    present_temp_eta_shared,
     present_pos_ts,
     last_sent_shared,
     has_sent_ever,
@@ -242,6 +277,8 @@ def _follower_process_main(
     stop_event,
     error_queue: multiprocessing.Queue,
     home_done,
+    homing_flag,
+    thermal_shutdown,
 ) -> None:
     """Sole owner of the motor connection: runs the read/smooth/send loop at
     config.send_rate_hz in its own process, so nothing in the caller's
@@ -250,9 +287,17 @@ def _follower_process_main(
     Communicates via shared memory only: `goal_pos_shared` (target),
     `mit_kp_shared`/`mit_kd_shared`/`tau_ff_shared` (how hard to chase it),
     `present_pos_shared`/`present_torq_shared`/`present_vel_shared`/
-    `present_pos_ts` (latest reading), `last_sent_shared` (what was actually
-    sent). `command_queue` carries disable/enable/clear_error/home, and
-    `home_done` reports the end of a home ramp back to go_home().
+    `present_temp_mos_shared`/`present_temp_rotor_shared`/`present_pos_ts`
+    (latest reading), `last_sent_shared` (what was actually sent).
+    `command_queue` carries disable/enable/clear_error/home, `home_done` and
+    `homing_flag` report the state of a home ramp back to the parent, and
+    `thermal_shutdown` asks it to disconnect an overheating arm.
+
+    Thermal watching lives here rather than in the parent because this loop
+    reads the temperatures anyway and keeps its rate regardless of what the
+    caller's process is doing -- a protection that a long GIL hold in the
+    parent (a dataset writer flushing a video, say) could stall is no
+    protection.
     """
     # Ignore SIGINT: a raw Ctrl-C could interrupt a send_mit() call
     # mid-transaction and leave a motor comm-faulted. Shutdown goes through
@@ -320,6 +365,10 @@ def _follower_process_main(
     use_mit = config.control_mode == "mit"
     interval = 1.0 / config.send_rate_hz
     gravity = _GravityCompensator(config, motor_names)
+    home_kp, home_kd = _configured_gains(config, motor_names)
+    thermal = ThermalMonitor(config, motor_names)
+    eta_interval = 1.0 / config.temp_sample_hz
+    next_eta_refresh = 0.0
 
     try:
         while not stop_event.is_set():
@@ -349,15 +398,39 @@ def _follower_process_main(
                 bus.poll_feedback_once()
             except Exception:
                 logger.warning("CAN bus poll feedback failed.")
+            temps: dict[str, tuple[float, float] | None] = {}
             for i, name in enumerate(motor_names):
                 state = motors[name].get_state()
                 present_pos_shared[i] = math.degrees(state.pos) if state is not None else 0.0
                 present_torq_shared[i] = state.torq if state is not None else 0.0
                 present_vel_shared[i] = math.degrees(state.vel) if state is not None else 0.0
+                # A motor that missed this tick keeps its last known
+                # temperature rather than reporting 0C: a dropout is not a cold
+                # motor, and feeding one to the fit would read as a steep cool.
+                if state is None:
+                    temps[name] = None
+                else:
+                    present_temp_mos_shared[i] = state.t_mos
+                    present_temp_rotor_shared[i] = state.t_rotor
+                    temps[name] = (state.t_mos, state.t_rotor)
             # From the angles just read, so the arm is carried at the pose it is
             # actually in rather than the one it was asked for.
             gravity_torques = gravity.torques(present_pos_shared)
             present_pos_ts.value = time.perf_counter()
+
+            # Latches on the first motor to reach the shutdown threshold. The
+            # parent does the disconnecting; this loop has to stay running to
+            # carry the home ramp that disconnect() starts.
+            if thermal.update(time.perf_counter(), temps) and not thermal_shutdown.is_set():
+                thermal_shutdown.set()
+
+            # Refitting all seven motors is far too costly to do every tick, and
+            # the estimate cannot move faster than the history behind it anyway.
+            if config.temp_debug and time.perf_counter() >= next_eta_refresh:
+                next_eta_refresh = time.perf_counter() + eta_interval
+                for i, name in enumerate(motor_names):
+                    eta = thermal.seconds_to_shutdown(name)
+                    present_temp_eta_shared[i] = _NO_ETA if eta is None else eta
 
             if home_requested:
                 home_ramp = _HomeRamp(
@@ -369,21 +442,30 @@ def _follower_process_main(
                 home_requested = False
 
             # Driven here rather than in go_home() so nothing holding the
-            # caller's GIL can freeze the goal mid-travel. Overwrites whatever
-            # send_action() last wrote, so a stale teleop loop can't fight it.
+            # caller's GIL can freeze the goal mid-travel.
+            goal_pos: dict[str, float] | None = None
+            homing_now = home_ramp is not None
             if home_ramp is not None:
                 elapsed = time.perf_counter() - home_started
                 target = home_ramp.target(elapsed)
+                # Still published, so that when the ramp ends the shared goal
+                # holds the pose the arm actually reached instead of the one
+                # send_action() left there before homing started.
                 for i, name in enumerate(motor_names):
                     goal_pos_shared[i] = target[name]
                 goal_ready.value = 1
+                # Dispatched from the ramp's own dict rather than read back out
+                # of shared memory: while homing, no other process gets to put
+                # a position anywhere near the motors.
+                goal_pos = target
                 if elapsed >= home_ramp.duration:
                     home_ramp = None
+                    homing_flag.value = 0
                     home_done.set()
-
-            if goal_ready.value:
+            elif goal_ready.value:
                 goal_pos = {name: goal_pos_shared[i] for i, name in enumerate(motor_names)}
 
+            if goal_pos is not None:
                 if config.enable_trajectory_smoothing:
                     now = time.perf_counter()
                     dt = now - last_send_time if last_send_time is not None else 0.0
@@ -410,12 +492,17 @@ def _follower_process_main(
                     pos_rad = math.radians(smoothed_pos[name])
                     vel_rad_s = math.radians(smoothed_vel[name])
                     tau = tau_ff_shared[i] + gravity_torques[i]
+                    # The ramp drives on the configured gains, not the caller's.
+                    # A softened joint (kp=0, as under gravity compensation)
+                    # ignores its goal entirely, so homing on the shared gains
+                    # moves only the joints that never used kp -- a FORCE_POS
+                    # gripper -- and leaves the arm to drop when torque goes.
+                    kp = home_kp[i] if homing_now else mit_kp_shared[i]
+                    kd = home_kd[i] if homing_now else mit_kd_shared[i]
                     try:
                         if name == GRIPPER_MOTOR:
                             if config.gripper_control_mode == "mit":
-                                motor.send_mit(
-                                    pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau
-                                )
+                                motor.send_mit(pos_rad, vel_rad_s, kp, kd, tau)
                             else:
                                 vel_deg_s = (
                                     config.pos_vel_velocity[idx]
@@ -424,9 +511,7 @@ def _follower_process_main(
                                 )
                                 motor.send_force_pos(pos_rad, math.radians(vel_deg_s), config.gripper_torque_ratio)
                         elif use_mit:
-                            motor.send_mit(
-                                pos_rad, vel_rad_s, mit_kp_shared[i], mit_kd_shared[i], tau
-                            )
+                            motor.send_mit(pos_rad, vel_rad_s, kp, kd, tau)
                         else:
                             vel_deg_s = (
                                 config.pos_vel_velocity[idx]
@@ -448,6 +533,7 @@ def _follower_process_main(
     finally:
         # A go_home() still waiting has nothing left to wait for; let it return
         # and find the arm wherever the ramp got to, rather than time out.
+        homing_flag.value = 0
         home_done.set()
         for motor in motors.values():
             if config.disable_torque_on_disconnect:
@@ -507,6 +593,15 @@ class RebotB601Follower(Robot):
         self._present_torq_shared = self._mp_ctx.Array("d", n, lock=False)
         # Written every tick alongside present_pos_shared, read by _present_vel().
         self._present_vel_shared = self._mp_ctx.Array("d", n, lock=False)
+        # MOSFET and rotor temperature (C), from the same feedback frame. Unlike
+        # the others these hold their last good value through a dropout, since a
+        # missing frame is not a cold motor.
+        self._present_temp_mos_shared = self._mp_ctx.Array("d", n, lock=False)
+        self._present_temp_rotor_shared = self._mp_ctx.Array("d", n, lock=False)
+        # Seconds until each motor reaches temp_max_c, or _NO_ETA. Only written
+        # when config.temp_debug is set.
+        self._present_temp_eta_shared = self._mp_ctx.Array("d", n, lock=False)
+        self._reset_temp_etas()
         self._present_pos_ts = self._mp_ctx.Value("d", 0.0, lock=False)
         # Smoothed position actually sent, read by send_action()'s return value.
         self._last_sent_shared = self._mp_ctx.Array("d", n, lock=False)
@@ -526,6 +621,15 @@ class RebotB601Follower(Robot):
         # Set by the follower process when a home ramp finishes; go_home()'s
         # only way of knowing, since it no longer drives the ramp itself.
         self._home_done = self._mp_ctx.Event()
+        # Raised by go_home() before it asks for a ramp and dropped by the
+        # follower process when the ramp ends. While it is up send_action()
+        # refuses to write, so nothing can steer the arm on its way home.
+        self._homing_flag = self._mp_ctx.Value("b", 0, lock=False)
+        # Set by the follower process's thermal monitor when a motor reaches
+        # the shutdown threshold, and watched by _thermal_watch() below.
+        self._thermal_shutdown = self._mp_ctx.Event()
+        self._thermal_thread: threading.Thread | None = None
+        self._thermal_thread_stop = threading.Event()
         self._follower_process: multiprocessing.process.BaseProcess | None = None
         # Parent-side mirror of the follower process's compensator, built on
         # first use by gravity_torques(). Stateless given the config, so the two
@@ -593,6 +697,7 @@ class RebotB601Follower(Robot):
         self._close_bus()
 
         self._start_follower_process()
+        self._start_thermal_watch()
         logger.info(f"{self} connected.")
 
     def _open_bus(self) -> None:
@@ -883,6 +988,76 @@ class RebotB601Follower(Robot):
             return dict.fromkeys(self.motor_names, 0.0)
         return {name: self._present_vel_shared[i] for i, name in enumerate(self.motor_names)}
 
+    def motor_temperatures(self) -> dict[str, dict[str, float]]:
+        """Present MOSFET and rotor temperature (C) per motor, from the
+        follower process's latest reading.
+
+        Same source tick as _present_pos(): every Damiao feedback frame carries
+        both temperatures alongside position, so reading them costs no extra
+        bus traffic. Falls back to 0.0 before the follower process's first tick.
+        """
+        if self._present_pos_ts.value == 0.0:
+            return {name: dict.fromkeys(COMPONENTS, 0.0) for name in self.motor_names}
+        return {
+            name: {
+                "mosfet": self._present_temp_mos_shared[i],
+                "rotor": self._present_temp_rotor_shared[i],
+            }
+            for i, name in enumerate(self.motor_names)
+        }
+
+    def _reset_temp_etas(self) -> None:
+        """Clear the published estimates, so a fresh follower process is never
+        read as reporting the previous one's."""
+        for i in range(len(self.motor_names)):
+            self._present_temp_eta_shared[i] = _NO_ETA
+
+    def motor_overheat_etas(self) -> dict[str, float | None]:
+        """Estimated seconds until each motor reaches temp_max_c, or None where
+        the history does not support an estimate (too little of it, or a motor
+        that is steady or cooling).
+
+        All None unless the robot was configured with temp_debug=True: the fit
+        is not cheap enough to run at loop rate for nobody.
+        """
+        return {
+            name: (None if self._present_temp_eta_shared[i] < 0.0 else self._present_temp_eta_shared[i])
+            for i, name in enumerate(self.motor_names)
+        }
+
+    def _start_thermal_watch(self) -> None:
+        """Watch for the follower process's shutdown request in a thread, so an
+        overheating arm comes down on its own schedule rather than whenever the
+        caller next happens to call into this object."""
+        if not self.config.temp_shutdown_enabled:
+            return
+        self._thermal_shutdown.clear()
+        self._thermal_thread_stop.clear()
+        self._thermal_thread = threading.Thread(
+            target=self._thermal_watch, name=f"{self}_thermal_watch", daemon=True
+        )
+        self._thermal_thread.start()
+
+    def _thermal_watch(self) -> None:
+        while not self._thermal_thread_stop.is_set():
+            if not self._thermal_shutdown.wait(0.2):
+                continue
+            logger.error(f"{self}: motor over maximum operating temperature; homing and disconnecting.")
+            try:
+                self.disconnect()
+            except Exception as e:
+                logger.error(f"{self}: thermal shutdown failed to disconnect cleanly: {e}")
+            return
+
+    def _stop_thermal_watch(self) -> None:
+        self._thermal_thread_stop.set()
+        thread = self._thermal_thread
+        # A thermal shutdown reaches here from inside the watch thread itself,
+        # which cannot join itself.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thermal_thread = None
+
     def _read_camera_or_last(self, cache_key: str, read_fn) -> Any:
         """Call `read_fn()`, falling back to the last successfully-read frame
         for `cache_key` on failure instead of crashing. Logs on the 1st
@@ -946,7 +1121,15 @@ class RebotB601Follower(Robot):
         its own fixed rate, so a stall in the caller's loop doesn't stall the
         motor. Returns what the follower process actually sent, falling back
         to the raw target before it has ticked yet.
+
+        Ignored entirely while the arm is homing: the ramp owns the arm until
+        it finishes, so a teleop loop that keeps calling cannot pull it off
+        course. The return value still reports what is being sent.
         """
+        if self._homing_flag.value:
+            logger.debug(f"{self}: ignoring action while homing.")
+            return {f"{name}.pos": self._last_sent_shared[i] for i, name in enumerate(self.motor_names)}
+
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
         # Clip against soft joint limits.
@@ -985,6 +1168,8 @@ class RebotB601Follower(Robot):
         self._ready_event.clear()
         self._goal_ready.value = 0
         self._has_sent_ever.value = 0
+        self._homing_flag.value = 0
+        self._reset_temp_etas()
         self._follower_process = self._mp_ctx.Process(
             target=_follower_process_main,
             args=(
@@ -995,6 +1180,9 @@ class RebotB601Follower(Robot):
                 self._present_pos_shared,
                 self._present_torq_shared,
                 self._present_vel_shared,
+                self._present_temp_mos_shared,
+                self._present_temp_rotor_shared,
+                self._present_temp_eta_shared,
                 self._present_pos_ts,
                 self._last_sent_shared,
                 self._has_sent_ever,
@@ -1006,6 +1194,8 @@ class RebotB601Follower(Robot):
                 self._stop_event,
                 self._error_queue,
                 self._home_done,
+                self._homing_flag,
+                self._thermal_shutdown,
             ),
             name=f"{self}_follower_process",
             daemon=True,
@@ -1060,6 +1250,11 @@ class RebotB601Follower(Robot):
             raise ConnectionError(f"{self}: follower process is not running; cannot home.")
 
         self._home_done.clear()
+        # Raised here rather than in the follower process so that no
+        # send_action() can land in the gap between asking for the ramp and the
+        # process picking the request up. The follower process drops it again
+        # when the ramp ends.
+        self._homing_flag.value = 1
         self._command_queue.put("home")
 
         # The ramp keeps its own schedule, so overrunning this means the
@@ -1067,14 +1262,24 @@ class RebotB601Follower(Robot):
         deadline = time.monotonic() + (
             self.config.home_duration_s + self.config.gripper_close_duration_s + _GRIPPER_SETTLE_SEC + 5.0
         )
-        while not self._home_done.wait(0.05):
-            if self._follower_process is None or not self._follower_process.is_alive():
-                raise ConnectionError(f"{self}: follower process stopped while homing.")
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"{self}: homing did not finish; the arm is part-way home.")
+        try:
+            while not self._home_done.wait(0.05):
+                if self._follower_process is None or not self._follower_process.is_alive():
+                    raise ConnectionError(f"{self}: follower process stopped while homing.")
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"{self}: homing did not finish; the arm is part-way home.")
+        except (ConnectionError, TimeoutError):
+            # Homing is over either way; leaving the flag up would wedge
+            # send_action() for the rest of the session.
+            self._homing_flag.value = 0
+            raise
 
     @check_if_not_connected
     def disconnect(self) -> None:
+        # Stopped before homing: the request has been acted on, and the watcher
+        # has nothing left to do while the arm ramps down.
+        self._stop_thermal_watch()
+
         if self.config.return_home_on_disconnect:
             try:
                 self.go_home()
