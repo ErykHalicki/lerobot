@@ -31,6 +31,7 @@ from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import MotorCalibration
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 from lerobot.utils.import_utils import _motorbridge_available, require_package
 
 from ..robot import Robot
@@ -829,6 +830,8 @@ class RebotB601Follower(Robot):
         # makes a motor expect continuous commands immediately, and checking
         # motors one at a time would leave earlier-enabled ones idle long
         # enough to fault.
+        silent: list[str] = []
+        first_error: Exception | None = None
         for motor_name, motor in self.motors.items():
             if motor_name == GRIPPER_MOTOR:
                 target_mode = MotorBridgeMode.MIT if gripper_use_mit else MotorBridgeMode.FORCE_POS
@@ -836,15 +839,33 @@ class RebotB601Follower(Robot):
                 target_mode = MotorBridgeMode.MIT
             else:
                 target_mode = MotorBridgeMode.POS_VEL
-            for attempt in range(_ENSURE_MODE_RETRIES + 1):
+            # Once one motor has gone silent the arm is not coming up, so the
+            # rest get a single attempt instead of the full retry budget: the
+            # point is only to name every unreachable joint in the error, and
+            # each retry costs a full ensure_mode timeout.
+            attempts = 1 if silent else _ENSURE_MODE_RETRIES + 1
+            for attempt in range(attempts):
                 try:
                     motor.ensure_mode(target_mode)
+                    logger.debug(f"{motor_name} mode set to {target_mode}")
                     break
-                except Exception:
-                    if attempt == _ENSURE_MODE_RETRIES:
-                        raise
-                    time.sleep(_SETTLE_SEC)
-            logger.debug(f"{motor_name} mode set to {target_mode}")
+                except Exception as exc:
+                    if attempt == attempts - 1:
+                        silent.append(motor_name)
+                        first_error = first_error or exc
+                    else:
+                        time.sleep(_SETTLE_SEC)
+
+        if silent:
+            joints = ", ".join(
+                f"{name} (can id 0x{self.config.motor_can_ids[name][0]:02x})" for name in silent
+            )
+            raise DeviceNotConnectedError(
+                f"{len(silent)} of {len(self.motors)} motors did not answer a mode read on "
+                f"{self.config.port}: {joints}. Check power and CAN wiring to those joints; a "
+                "contiguous run of unreachable joints points at the link just upstream of the "
+                f"first one. Underlying error: {first_error}"
+            ) from first_error
 
         # Not enabling here: this connection closes right after, and the
         # follower process reopens its own before sending any traffic.
