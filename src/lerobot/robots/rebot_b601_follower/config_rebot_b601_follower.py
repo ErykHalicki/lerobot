@@ -178,7 +178,7 @@ class RebotB601FollowerConfig:
     # long the smoothed position takes to catch up to a step change in
     # target. Must be meaningfully larger than the tick interval, or the
     # per-tick gain (min(1, dt/tau)) degrades toward pass-through.
-    smoothing_time_constant_s: float | list[float] = 0.04
+    smoothing_time_constant_s: float | list[float] = 0.02
 
     # Soft joint limits (degrees). These are clipped against on every action.
     joint_limits: dict[str, tuple[float, float]] = field(
