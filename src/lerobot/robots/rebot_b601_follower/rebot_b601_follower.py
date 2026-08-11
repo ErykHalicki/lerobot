@@ -98,9 +98,12 @@ class _SCurveAxis:
             self._s1 = self._s2 = self._s3 = target_pos
             return target_pos, 0.0
 
-        # Clamp to 1.0 (full pass-through) once dt >= tau_s, instead of
-        # letting dt/tau_s exceed 1 and overshoot each stage's bound.
-        a = min(1.0, dt / self.tau_s) if self.tau_s > 0 else 1.0
+        # Exact per-step gain of a first-order lag, rather than dt/tau_s clamped to
+        # 1: the clamped form reaches full pass-through (no smoothing at all) the
+        # moment a tick stretches to tau_s, so a loaded CPU turns the filter off on
+        # exactly the ticks that most need it. This form approaches 1 without ever
+        # reaching it, so no dt can make a stage overshoot its bound either.
+        a = -math.expm1(-dt / self.tau_s) if self.tau_s > 0 else 1.0
         self._s1 += a * (target_pos - self._s1)
         self._s2 += a * (self._s1 - self._s2)
         prev_s3 = self._s3
