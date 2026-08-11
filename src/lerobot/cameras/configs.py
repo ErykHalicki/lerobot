@@ -52,7 +52,14 @@ class Cv2Backends(int, Enum):
     MSMF = 1400
 
     @classmethod
-    def _missing_(cls, value: object) -> None:
+    def _missing_(cls, value: object) -> "Cv2Backends":
+        # Accept a backend by name ("V4L2") as well as by its cv2 integer, so config
+        # files can name one without hardcoding the constant.
+        if isinstance(value, str):
+            try:
+                return cls[value.strip().upper()]
+            except KeyError:
+                pass
         raise ValueError(f"`backend` is expected to be in {list(cls)}, but {value} is provided.")
 
 
