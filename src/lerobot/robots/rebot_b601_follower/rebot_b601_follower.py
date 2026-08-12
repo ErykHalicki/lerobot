@@ -173,19 +173,23 @@ class _HomeRamp:
 
     Sampled by elapsed time rather than stepped, so the arm arrives on schedule
     whatever the driving loop does: a late tick resumes where the clock says,
-    instead of stretching the ramp out. Eased, so a joint that starts far from
-    zero doesn't travel any faster than one that starts close.
+    instead of stretching the ramp out. Eased on a quintic S-curve, so a joint
+    that starts far from zero doesn't travel any faster than one that starts
+    close, and no leg begins or ends with a step in acceleration.
 
     Three legs, held in one object so whoever drives it keeps no state:
 
-    1. every joint eases to 0 over `home_duration_s`, except the gripper, which
+    1. every joint eases to 0 over `home_duration_s`, or its own span from
+       `home_joint_durations_s` -- a joint that swings into the frame on its way
+       to zero needs longer than the rest. The exceptions are the gripper, which
        opens all the way (so it can't be gripping anything while the arm moves)
        and the wrist, which holds `home_wrist_flex_deg` to keep whatever is on
        the end clear of the shoulder -- coming in flat swings it into the
-       shoulder at full ramp speed.
-    2. the gripper closes to 0 while the wrist lowers to 0 over
-       `gripper_close_duration_s`, so the load is set down over the whole close
-       rather than dropped at the end of it.
+       shoulder at full ramp speed. The leg lasts as long as its slowest joint;
+       the rest reach zero early and hold it.
+    2. the gripper closes to 0 over `gripper_close_duration_s` while the wrist
+       lowers to 0 over `wrist_lower_duration_s`, so the load is set down over
+       the whole close rather than dropped at the end of it.
     3. the settled pose is held for _GRIPPER_SETTLE_SEC, since both are still
        travelling when their goals stop moving.
     """
@@ -209,19 +213,47 @@ class _HomeRamp:
         self._close[GRIPPER_MOTOR] = (gripper_open, 0.0)
         self._close[WRIST_MOTOR] = (wrist_up, 0.0)
 
-        self._approach_s = config.home_duration_s
-        self._close_s = config.gripper_close_duration_s
-        self.duration = self._approach_s + self._close_s + _GRIPPER_SETTLE_SEC
+        unknown = set(config.home_joint_durations_s) - set(motor_names)
+        if unknown:
+            raise ValueError(
+                f"home_joint_durations_s names {sorted(unknown)} are not motors; "
+                f"pick from {motor_names}"
+            )
+        self._approach_spans = dict.fromkeys(motor_names, config.home_duration_s)
+        self._approach_spans.update(config.home_joint_durations_s)
+        # The leg runs until its slowest joint arrives; the ease holds every
+        # other joint at zero once its own span is up.
+        self.approach_duration = max(self._approach_spans.values())
+
+        # Per joint on the close leg too, so the wrist can come down on a span
+        # of its own while the gripper closes on the gripper's.
+        self._close_spans = dict.fromkeys(motor_names, config.gripper_close_duration_s)
+        self._close_spans[WRIST_MOTOR] = config.wrist_lower_duration_s
+
+        self.duration = self.approach_duration + max(self._close_spans.values()) + _GRIPPER_SETTLE_SEC
 
     def target(self, elapsed: float) -> dict[str, float]:
         """The goal position (degrees) for every joint `elapsed` seconds in."""
-        if elapsed < self._approach_s:
-            leg, span, t = self._approach, self._approach_s, elapsed
+        if elapsed < self.approach_duration:
+            leg, spans, t = self._approach, self._approach_spans, elapsed
         else:
-            leg, span, t = self._close, self._close_s, elapsed - self._approach_s
+            leg, spans, t = self._close, self._close_spans, elapsed - self.approach_duration
+        return {
+            name: self._clip(name, s + self._ease(t, spans[name]) * (e - s))
+            for name, (s, e) in leg.items()
+        }
+
+    @staticmethod
+    def _ease(t: float, span: float) -> float:
+        """Fraction of a leg travelled `t` seconds into a `span`-second move.
+
+        Quintic smootherstep: zero velocity *and* zero acceleration at both
+        ends, so torque builds up and lets go gradually. Cubic smoothstep steps
+        acceleration straight to its peak at t=0, which the arm takes as a jerk
+        impulse at the start and end of every leg.
+        """
         frac = min(1.0, t / span) if span > 0 else 1.0
-        eased = frac * frac * (3.0 - 2.0 * frac)  # smoothstep: zero velocity at both ends
-        return {name: self._clip(name, s + eased * (e - s)) for name, (s, e) in leg.items()}
+        return frac * frac * frac * (frac * (6.0 * frac - 15.0) + 10.0)
 
     def _clip(self, name: str, value: float) -> float:
         """Same soft joint limits send_action() applies, since the ramp reaches
@@ -1283,9 +1315,9 @@ class RebotB601Follower(Robot):
 
         # The ramp keeps its own schedule, so overrunning this means the
         # follower process is gone or wedged, not that homing is taking longer.
-        deadline = time.monotonic() + (
-            self.config.home_duration_s + self.config.gripper_close_duration_s + _GRIPPER_SETTLE_SEC + 5.0
-        )
+        approach_s = max(self.config.home_duration_s, *self.config.home_joint_durations_s.values(), 0.0)
+        close_s = max(self.config.gripper_close_duration_s, self.config.wrist_lower_duration_s)
+        deadline = time.monotonic() + (approach_s + close_s + _GRIPPER_SETTLE_SEC + 5.0)
         try:
             while not self._home_done.wait(0.05):
                 if self._follower_process is None or not self._follower_process.is_alive():

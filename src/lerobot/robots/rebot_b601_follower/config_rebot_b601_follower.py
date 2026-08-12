@@ -51,13 +51,26 @@ class RebotB601FollowerConfig:
     # Time to spend ramping to the home position in disconnect(), regardless
     # of starting distance. The gripper opens fully during this ramp instead
     # of moving to 0° with the other joints, so it can't be gripping anything
-    # while the arm moves.
-    home_duration_s: float = 1.67
+    # while the arm moves. The quintic ease peaks at 1.875x the average speed,
+    # so a short duration here is what makes the arm snap.
+    home_duration_s: float = 2.0
+
+    # Per-joint overrides of home_duration_s, e.g. {"elbow_flex": 2.5}. For a
+    # joint that swings into the frame on its way to zero: everything else
+    # arrives on the shared span and holds while it finishes, so the ramp lasts
+    # as long as its slowest joint.
+    home_joint_durations_s: dict[str, float] = field(
+        default_factory=lambda: {"elbow_flex": 2.5}
+    )
 
     # Time to spend closing the gripper to 0° after home_duration_s, once
-    # every other joint (and the gripper itself, fully open) has arrived. The
-    # wrist lowers from home_wrist_flex_deg to 0° over this same span.
-    gripper_close_duration_s: float = 0.67
+    # every other joint (and the gripper itself, fully open) has arrived.
+    gripper_close_duration_s: float = 1.0
+
+    # Time the wrist takes to lower from home_wrist_flex_deg back to 0°, over
+    # the same leg the gripper closes in. Its own span so it can drop quickly
+    # without hurrying the gripper; the leg lasts as long as the slower one.
+    wrist_lower_duration_s: float = 0.67
 
     # Where to hold wrist_flex while the arm ramps home, in degrees; negative
     # points the gripper up. Keeps whatever is on the end clear of the shoulder

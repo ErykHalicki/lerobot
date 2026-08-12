@@ -320,14 +320,67 @@ def test_home_ramp_opens_gripper_and_lifts_wrist_before_lowering_them():
     ramp = _HomeRamp(cfg, motor_names, dict.fromkeys(motor_names, 40.0))
 
     # End of the approach leg: gripper wide open, wrist held clear of the shoulder.
-    approach_end = ramp.target(cfg.home_duration_s)
+    approach_end = ramp.target(ramp.approach_duration)
     assert approach_end[GRIPPER_MOTOR] == pytest.approx(cfg.joint_limits[GRIPPER_MOTOR][0])
     assert approach_end[WRIST_MOTOR] == pytest.approx(cfg.home_wrist_flex_deg)
 
     # Both come down together over the close leg, rather than dropping at its end.
-    mid_close = ramp.target(cfg.home_duration_s + cfg.gripper_close_duration_s / 2)
+    mid_close = ramp.target(ramp.approach_duration + cfg.gripper_close_duration_s / 2)
     assert abs(mid_close[GRIPPER_MOTOR]) < abs(approach_end[GRIPPER_MOTOR])
     assert abs(mid_close[WRIST_MOTOR]) < abs(approach_end[WRIST_MOTOR])
+
+
+def test_home_ramp_lowers_the_wrist_on_its_own_span():
+    # The wrist drops on its own span rather than the gripper's, so hurrying it
+    # cannot hurry the close.
+    cfg = RebotB601FollowerRobotConfig(port="/dev/null", wrist_lower_duration_s=0.4)
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        motor_names = RebotB601Follower(cfg).motor_names
+    ramp = _HomeRamp(cfg, motor_names, dict.fromkeys(motor_names, 40.0))
+
+    # Wrist down while the gripper is still closing on its own, longer span.
+    wrist_done = ramp.target(ramp.approach_duration + cfg.wrist_lower_duration_s)
+    assert wrist_done[WRIST_MOTOR] == pytest.approx(0.0)
+    assert wrist_done[GRIPPER_MOTOR] != pytest.approx(0.0)
+    assert ramp.duration == pytest.approx(
+        ramp.approach_duration + cfg.gripper_close_duration_s + 0.5
+    )
+
+
+def test_home_ramp_gives_a_named_joint_a_longer_approach():
+    # A joint that would swing into the frame on its way to zero gets its own
+    # span; the leg runs until it arrives, and the rest hold zero meanwhile.
+    slow, fast = 4.0, 1.0
+    cfg = RebotB601FollowerRobotConfig(
+        port="/dev/null", home_duration_s=fast, home_joint_durations_s={"elbow_flex": slow}
+    )
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        motor_names = RebotB601Follower(cfg).motor_names
+    travel = -60.0  # inside every joint's soft limits, so nothing here is clipped
+    ramp = _HomeRamp(cfg, motor_names, dict.fromkeys(motor_names, travel))
+
+    assert ramp.approach_duration == pytest.approx(slow)
+
+    at_fast_span = ramp.target(fast)
+    assert at_fast_span["shoulder_pan"] == pytest.approx(0.0)
+    assert abs(at_fast_span["elbow_flex"]) > abs(travel) / 2  # still most of the way out
+    assert ramp.target(slow)["elbow_flex"] == pytest.approx(0.0)
+
+    # Slower for the whole travel, not just at the end.
+    def peak_speed(joint, span, dt=0.005):
+        samples = [ramp.target(i * dt)[joint] for i in range(int(span / dt) + 1)]
+        return max(abs(b - a) for a, b in zip(samples[:-1], samples[1:], strict=True)) / dt
+
+    assert peak_speed("elbow_flex", slow) < peak_speed("shoulder_pan", fast) / 2
+
+
+def test_home_ramp_rejects_a_duration_for_something_that_is_not_a_joint():
+    cfg = RebotB601FollowerRobotConfig(port="/dev/null", home_joint_durations_s={"elbow": 3.0})
+    with patch(f"{_MODULE}.require_package", lambda *a, **kw: None):
+        motor_names = RebotB601Follower(cfg).motor_names
+
+    with pytest.raises(ValueError, match="elbow"):
+        _HomeRamp(cfg, motor_names, dict.fromkeys(motor_names, 40.0))
 
 
 def test_home_ramp_is_monotonic_and_eased():
@@ -340,10 +393,19 @@ def test_home_ramp_is_monotonic_and_eased():
     samples = [ramp.target(cfg.home_duration_s * i / steps)["shoulder_pan"] for i in range(steps + 1)]
     assert all(b <= a + 1e-9 for a, b in zip(samples[:-1], samples[1:], strict=True))
 
-    # Smoothstep: the first step is far smaller than one at the midpoint.
+    # Eased: the first step is far smaller than one at the midpoint.
     first = abs(samples[1] - samples[0])
     middle = abs(samples[steps // 2 + 1] - samples[steps // 2])
     assert first < middle / 2
+
+    # Acceleration starts and ends at zero, not just velocity: the second
+    # difference has to fade in at both ends rather than jump to its peak.
+    second_diffs = [
+        abs(a - 2 * b + c) for a, b, c in zip(samples[:-2], samples[1:-1], samples[2:], strict=True)
+    ]
+    peak = max(second_diffs)
+    assert second_diffs[0] < peak / 3
+    assert second_diffs[-1] < peak / 3
 
 
 def test_home_ramp_clips_to_joint_limits():
@@ -452,6 +514,7 @@ def _run_home_ramp_with_gains(kp: float, kd: float) -> dict[str, list]:
         control_mode="mit",
         home_duration_s=0.2,
         gripper_close_duration_s=0.1,
+        home_joint_durations_s={},  # no per-joint override, so the ramp stays short
         enable_trajectory_smoothing=False,
     )
     robot = RebotB601Follower(config)
