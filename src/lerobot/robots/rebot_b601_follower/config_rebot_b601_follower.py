@@ -176,6 +176,15 @@ class RebotB601FollowerConfig:
     # irregularly the caller calls send_action().
     send_rate_hz: float = 100.0
 
+    # How long the follower process keeps running through CAN transactions that
+    # fail (a dm-serial write timing out on a busy USB bridge, say) before it
+    # gives up and stops. A tick that fails is retried on the next one; the
+    # motors hold their last goal and their last reading meanwhile, so a drop
+    # shorter than this is invisible to the caller. Long enough to ride out an
+    # intermittent bridge, short enough that a truly wedged one still drops
+    # torque promptly.
+    can_error_grace_s: float = 2.0
+
     # If set, the follower process attaches its own FileHandler to this path
     # and enables DEBUG on its own logger, since it's a separate process and
     # can't share the caller's logging handlers directly.

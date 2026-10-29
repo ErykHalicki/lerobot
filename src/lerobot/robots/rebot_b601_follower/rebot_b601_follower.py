@@ -291,6 +291,45 @@ def _configured_gains(
     )
 
 
+class _BusErrors:
+    """Rides out intermittent CAN failures, and says when they stop being
+    intermittent.
+
+    A transaction that fails is retried on the next tick instead of being taken
+    as a lost connection: on this arm a dm-serial write times out now and then
+    with the bus otherwise healthy, and dying on one of those costs a whole
+    session. The motors hold their last goal and their last reading across the
+    gap, so a short one never reaches the caller. `expired()` reports the case
+    that is not a blip -- no tick has fully succeeded for `grace_s`, which is a
+    wedged bridge, and the arm should come down.
+    """
+
+    def __init__(self, grace_s: float):
+        self.grace_s = grace_s
+        self.last_error: str | None = None
+        self._this_tick: str | None = None
+        self._failed_since: float | None = None
+        self._ticks = 0
+
+    def failed(self, what: str, err: Exception) -> None:
+        self._this_tick = self.last_error = f"{what}: {err}"
+
+    def expired(self, now: float) -> bool:
+        """Close the current tick, returning True once the grace window is up."""
+        err, self._this_tick = self._this_tick, None
+        if err is None:
+            if self._ticks:
+                logger.info(f"CAN traffic resumed after {self._ticks} failed tick(s).")
+            self._failed_since, self._ticks = None, 0
+            return False
+        if self._failed_since is None:
+            self._failed_since = now
+        self._ticks += 1
+        if self._ticks == 1 or self._ticks % 50 == 0:
+            logger.warning(f"CAN transaction failed on {self._ticks} tick(s) in a row -- {err}")
+        return now - self._failed_since >= self.grace_s
+
+
 def _follower_process_main(
     config: RebotB601FollowerRobotConfig,
     motor_names: list[str],
@@ -403,6 +442,7 @@ def _follower_process_main(
     gravity = _GravityCompensator(config, motor_names)
     home_kp, home_kd = _configured_gains(config, motor_names)
     thermal = ThermalMonitor(config, motor_names)
+    bus_errors = _BusErrors(config.can_error_grace_s)
     eta_interval = 1.0 / config.temp_sample_hz
     next_eta_refresh = 0.0
 
@@ -428,12 +468,15 @@ def _follower_process_main(
                     # reading this tick is about to take rather than the last one.
                     home_requested = True
 
-            for motor in motors.values():
-                motor.request_feedback()
+            for name, motor in motors.items():
+                try:
+                    motor.request_feedback()
+                except Exception as e:
+                    bus_errors.failed(f"feedback request to {name}", e)
             try:
                 bus.poll_feedback_once()
-            except Exception:
-                logger.warning("CAN bus poll feedback failed.")
+            except Exception as e:
+                bus_errors.failed("feedback poll", e)
             temps: dict[str, tuple[float, float] | None] = {}
             for i, name in enumerate(motor_names):
                 state = motors[name].get_state()
@@ -556,9 +599,15 @@ def _follower_process_main(
                             )
                             motor.send_pos_vel(pos_rad, math.radians(vel_deg_s))
                     except Exception as e:
-                        logger.warning(f"Follower process failed to send to {name}: {e}")
+                        bus_errors.failed(f"send to {name}", e)
                     last_sent_shared[i] = smoothed_pos[name]
                 has_sent_ever.value = 1
+
+            if bus_errors.expired(time.perf_counter()):
+                error_queue.put(
+                    f"CAN bus unusable for {config.can_error_grace_s:g}s -- {bus_errors.last_error}"
+                )
+                break
 
             if logger.isEnabledFor(logging.DEBUG) and prev_tick is not None:
                 logger.debug(f"follower process tick interval: {(t0 - prev_tick) * 1e3:.1f}ms")
@@ -571,12 +620,19 @@ def _follower_process_main(
         # and find the arm wherever the ramp got to, rather than time out.
         homing_flag.value = 0
         home_done.set()
+        # Suppressed one call at a time: the loop above exits on a bus that has
+        # stopped answering, and an exception here would leave the remaining
+        # motors and the serial device open, so the next connect() finds it busy.
         for motor in motors.values():
             if config.disable_torque_on_disconnect:
-                motor.disable()
-            motor.clear_error()
-            motor.close()
-        bus.close()
+                with contextlib.suppress(Exception):
+                    motor.disable()
+            with contextlib.suppress(Exception):
+                motor.clear_error()
+            with contextlib.suppress(Exception):
+                motor.close()
+        with contextlib.suppress(Exception):
+            bus.close()
 
 
 class RebotB601Follower(Robot):
@@ -1219,7 +1275,32 @@ class RebotB601Follower(Robot):
             last_sent = goal_pos
         return {f"{motor}.pos": val for motor, val in last_sent.items()}
 
+    def restart_follower_process(self) -> None:
+        """Reopen the motor connection after the follower process stopped on its own
+        (a CAN bus that stayed unusable past `can_error_grace_s`, say).
+
+        Public capability: callers that ride out a mid-session hardware drop detect it by
+        this method's presence. Only the motor link is rebuilt -- the cameras never went
+        anywhere, and reconnecting them costs seconds this is meant to save. The arm was
+        left limp by the stopped process, so it has fallen wherever gravity took it;
+        `go_home()` is the caller's job before commanding it again.
+        """
+        self._stop_follower_process()
+        # The device is only free once the old process has finished closing it.
+        time.sleep(0.3)
+        self._start_follower_process()
+
+    def follower_error(self) -> str | None:
+        """Why the follower process stopped, if it said."""
+        error = None
+        while not self._error_queue.empty():
+            error = self._error_queue.get()
+        return error
+
     def _start_follower_process(self) -> None:
+        # A stopped process may have left its reason here; the readiness wait below reads
+        # this queue as "the process that is starting now has failed".
+        self.follower_error()
         self._stop_event.clear()
         self._ready_event.clear()
         self._goal_ready.value = 0
@@ -1330,8 +1411,11 @@ class RebotB601Follower(Robot):
             self._homing_flag.value = 0
             raise
 
-    @check_if_not_connected
     def disconnect(self) -> None:
+        """Unconditional, unlike the rest of the interface: a session that ends because
+        the follower process stopped still has cameras to close, and raising
+        DeviceNotConnectedError here would bury whatever the caller was already
+        handling."""
         # Stopped before homing: the request has been acted on, and the watcher
         # has nothing left to do while the arm ramps down.
         self._stop_thermal_watch()
@@ -1349,6 +1433,9 @@ class RebotB601Follower(Robot):
         self._stop_follower_process()
 
         for cam in self.cameras.values():
-            cam.disconnect()
+            try:
+                cam.disconnect()
+            except Exception as e:
+                logger.warning(f"{self}: camera did not close cleanly: {e}")
 
         logger.info(f"{self} disconnected.")
